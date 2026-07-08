@@ -1,6 +1,7 @@
-# 个人自用脚本库，感谢yahuisme大佬的原始脚本，我个人增加了的sni校验和防火墙设置，以及修正了密钥对的解析错误。
+# 个人自用脚本库
 
 ## Proxy Installer
+> 感谢yahuisme大佬的原始脚本，我个人增加了的sni校验和防火墙设置，以及修正了密钥对的解析错误。
 ```
 wget https://github.com/iPixelOldC/Scripts/raw/refs/heads/main/vlesswithss.sh
 ```
@@ -13,6 +14,7 @@ bash <(curl -L https://github.com/iPixelOldC/Scripts/raw/refs/heads/main/vlesswi
 > Note：nosni那个要手动管理防火墙
 
 ## SSH Key Installer
+> 感谢P3TERX大佬的原始脚本，我个人增加了CodeBerg的获取
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/iPixelOldC/Scripts/refs/heads/main/key.sh) -g iPixelOldC -d
 ```
