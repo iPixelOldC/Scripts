@@ -156,8 +156,14 @@ generate_ss_key() {
 build_vless_inbound() {
     # 第 7 个可选参数 mldsa65_seed：为空时使用标准 x25519（向后兼容）
     # 第 8 个可选参数 fallback_limit：为 "afterBytes,bytesPerSec,burstBytesPerSec" 时写入回落限速
-    local port="$1" uuid="$2" domain="$3" private_key="$4" public_key="$5" internal_port="$6" mldsa65_seed="${7:-}" fallback_limit="${8:-}" shortid="94451705"
-    local limit_json='{}'
+    # 第 9 个可选参数 use_dokodemo：true=dest 指向本地 dokodemo（防盗刷）；false=dest 直连目标（默认）
+    local port="$1" uuid="$2" domain="$3" private_key="$4" public_key="$5" internal_port="$6" mldsa65_seed="${7:-}" fallback_limit="${8:-}" use_dokodemo="${9:-false}" shortid="94451705"
+    local limit_json='{}' dest_addr
+    if [[ "$use_dokodemo" == true && -n "$internal_port" ]]; then
+        dest_addr="127.0.0.1:${internal_port}"
+    else
+        dest_addr="${domain}:443"
+    fi
     if [[ -n "$fallback_limit" ]]; then
         local after_bytes bytes_per_sec burst
         IFS=',' read -r after_bytes bytes_per_sec burst <<< "$fallback_limit"
@@ -165,8 +171,8 @@ build_vless_inbound() {
             '{limitFallbackUpload: {afterBytes: $a, bytesPerSec: $b, burstBytesPerSec: $c},
               limitFallbackDownload: {afterBytes: $a, bytesPerSec: $b, burstBytesPerSec: $c}}')
     fi
-    jq -n --argjson port "$port" --arg uuid "$uuid" --arg domain "$domain" --arg private_key "$private_key" --arg public_key "$public_key" --arg shortid "$shortid" --argjson internal_port "$internal_port" --arg mldsa65_seed "$mldsa65_seed" --argjson limit_json "$limit_json" \
-    '{"listen": "0.0.0.0", "port": $port, "protocol": "vless", "settings": {"clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": ({"show": false, "dest": ("127.0.0.1:" + ($internal_port | tostring)), "xver": 0, "serverNames": [$domain], "privateKey": $private_key, "publicKey": $public_key, "shortIds": [$shortid]} + (if $mldsa65_seed != "" then {"mldsa65Seed": $mldsa65_seed} else {} end) + $limit_json)}, "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]} }'
+    jq -n --argjson port "$port" --arg uuid "$uuid" --arg domain "$domain" --arg private_key "$private_key" --arg public_key "$public_key" --arg shortid "$shortid" --arg dest_addr "$dest_addr" --arg mldsa65_seed "$mldsa65_seed" --argjson limit_json "$limit_json" \
+    '{"listen": "0.0.0.0", "port": $port, "protocol": "vless", "settings": {"clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": ({"show": false, "dest": $dest_addr, "xver": 0, "serverNames": [$domain], "privateKey": $private_key, "publicKey": $public_key, "shortIds": [$shortid]} + (if $mldsa65_seed != "" then {"mldsa65Seed": $mldsa65_seed} else {} end) + $limit_json)}, "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]} }'
 }
 
 # 回落限速参数生成：官方要求脚本随机化，避免全网参数雷同形成指纹
@@ -304,10 +310,77 @@ build_dokodemo_inbound() {
     }'
 }
 
-# --- 防盗刷：防火墙配置 ---
+# --- 防盗刷开关：统一判断当前配置是否启用了 dokodemo ---
+has_dokodemo() {
+    [[ -f "$xray_config_path" ]] || return 1
+    local tag
+    tag=$(jq -r '.inbounds[] | select(.tag == "dokodemo-in") | .tag' "$xray_config_path" 2>/dev/null || true)
+    [[ -n "$tag" ]]
+}
+
+# 交互询问是否启用 dokodemo（防盗刷）
+# 参数: $1=默认值(yes|no)  $2=是否允许"留空不改"(true|false)
+# 输出到全局变量 USE_DOKODEMO=true|false
+USE_DOKODEMO=false
+prompt_for_dokodemo() {
+    local default_choice="${1:-no}"
+    local allow_keep="${2:-false}"
+    local answer prompt_text
+
+    if [[ "$allow_keep" == true ]]; then
+        local cur_state="关闭"
+        has_dokodemo && cur_state="启用"
+        prompt_text=" -> 防盗刷转发 dokodemo-door (当前: ${cyan}${cur_state}${none}) [y=启用 n=关闭, 留空不改]: "
+        read -p "$(echo -e "$prompt_text")" answer || true
+        if [[ -z "$answer" ]]; then
+            has_dokodemo && USE_DOKODEMO=true || USE_DOKODEMO=false
+            return 0
+        fi
+    else
+        local hint="y/N"
+        [[ "$default_choice" == yes ]] && hint="Y/n"
+        read -p " -> 是否启用防盗刷转发 dokodemo-door？[${hint}]: " answer || true
+        if [[ -z "$answer" ]]; then
+            [[ "$default_choice" == yes ]] && USE_DOKODEMO=true || USE_DOKODEMO=false
+            return 0
+        fi
+    fi
+
+    if [[ "$answer" =~ ^[yY]$ ]]; then
+        USE_DOKODEMO=true
+    else
+        USE_DOKODEMO=false
+    fi
+    return 0
+}
+
+# 询问内部转发端口（仅在启用 dokodemo 时调用）
+prompt_for_internal_port() {
+    local -n o_port="$1"
+    local current="${2:-23333}"
+    local default_port="${3:-23333}"
+    local input
+
+    while true; do
+        read -p "$(echo -e " -> 内部转发端口 (仅本机监听, 当前: ${cyan}${current}${none}, 默认 ${default_port}): ")" input || true
+        [[ -z "$input" ]] && input="$default_port"
+        if is_valid_port "$input"; then
+            # o_port 是 nameref（local -n），赋值即写入调用方变量
+            # shellcheck disable=SC2034
+            o_port="$input"
+            return 0
+        fi
+        error "端口无效，请输入 1-65535。"
+    done
+}
+
+# --- 防火墙配置（幂等：清理旧端口 + 开放新端口 + 确保内部端口不对外开放） ---
+# 参数: external_port [internal_port] [old_external_port] [old_internal_port]
 setup_firewalld() {
     local external_port="$1"
-    local internal_port="$2"
+    local internal_port="${2:-}"
+    local old_external_port="${3:-}"
+    local old_internal_port="${4:-}"
 
     if ! command -v firewall-cmd &>/dev/null; then
         info "firewalld 未安装，正在自动安装..."
@@ -319,7 +392,8 @@ setup_firewalld() {
             yum install -y firewalld &> /dev/null
         fi
         if ! command -v firewall-cmd &>/dev/null; then
-            warning "firewalld 安装失败，请手动配置防火墙：开放 ${external_port}/tcp，不开放 ${internal_port}/tcp"
+            warning "firewalld 安装失败，请手动配置防火墙：开放 ${external_port}/tcp"
+            [[ -n "$internal_port" ]] && warning "并确保 ${internal_port}/tcp 不要对外开放"
             return 1
         fi
         success "firewalld 安装成功。"
@@ -334,11 +408,49 @@ setup_firewalld() {
     fi
 
     info "正在配置防火墙规则..."
+    # 1) 先关闭不再需要的旧端口（端口变更 / 关闭防盗刷时）
+    if [[ -n "$old_external_port" && "$old_external_port" != "$external_port" ]]; then
+        firewall-cmd --permanent --remove-port="${old_external_port}/tcp" >/dev/null 2>&1 || true
+        info "已关闭旧的外部端口: ${old_external_port}/tcp"
+    fi
+    if [[ -n "$old_internal_port" && ( -z "$internal_port" || "$old_internal_port" != "$internal_port" ) ]]; then
+        firewall-cmd --permanent --remove-port="${old_internal_port}/tcp" >/dev/null 2>&1 || true
+    fi
+
+    # 2) 开放当前外部端口
     firewall-cmd --permanent --add-port="${external_port}/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --remove-port="${internal_port}/tcp" >/dev/null 2>&1 || true
+
+    # 3) 内部端口任何情况下都不对外开放
+    if [[ -n "$internal_port" ]]; then
+        firewall-cmd --permanent --remove-port="${internal_port}/tcp" >/dev/null 2>&1 || true
+    fi
+
     firewall-cmd --reload >/dev/null 2>&1 || true
 
-    success "防火墙规则已生效：端口 ${external_port} 已开放 (外部访问)，端口 ${internal_port} 未对外开放 (防盗刷)。"
+    if [[ -n "$internal_port" ]]; then
+        success "防火墙规则已生效：外部端口 ${external_port} 已开放，内部端口 ${internal_port} 未对外开放。"
+    else
+        success "防火墙规则已生效：外部端口 ${external_port} 已开放（直连模式，无内部转发端口）。"
+    fi
+}
+
+# 开放额外端口（如 Shadowsocks），不涉及内部端口逻辑
+# 参数: $1=端口  $2=用途名称(可选，仅用于输出)
+open_extra_port() {
+    local port="$1"
+    local label="${2:-额外}"
+    [[ -n "$port" ]] || return 0
+    if ! command -v firewall-cmd &>/dev/null; then
+        warning "firewalld 未安装，请手动开放 ${port}/tcp"
+        return 0
+    fi
+    if ! systemctl is-active --quiet firewalld; then
+        return 0
+    fi
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    info "已开放 ${label} 端口: ${port}/tcp"
+    return 0
 }
 
 write_config() {
@@ -346,6 +458,7 @@ write_config() {
     local sni="${2:-}"
     local config_content
 
+    # sni 非空表示启用了 dokodemo 防盗刷，此时才需要 SNI 白名单 routing + block 出站
     if [[ -n "$sni" ]]; then
         config_content=$(jq -n --argjson inbounds "$inbounds_json" --arg sni "$sni" \
         '{
@@ -521,51 +634,132 @@ is_valid_domain() {
     [[ "$domain" =~ ^[a-zA-Z0-9-]{1,63}(\.[a-zA-Z0-9-]{1,63})+$ ]] && [[ "$domain" != *--* ]]
 }
 
+# --- reality-checker 集成（可选工具，自动探测；找不到就跳过） ---
+# 工具来源: https://github.com/V2RaySSR/RealityChecker
+# 用法: reality-checker check <域名>
+find_reality_checker() {
+    local c
+    # 1) PATH 中直接可用
+    if command -v reality-checker &>/dev/null; then
+        command -v reality-checker
+        return 0
+    fi
+    # 2) 脚本同目录（用户习惯放置位置）
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || script_dir=""
+    if [[ -n "$script_dir" ]]; then
+        for c in "$script_dir/reality-checker" "$script_dir/RealityChecker/reality-checker"; do
+            if [[ -x "$c" ]]; then echo "$c"; return 0; fi
+        done
+    fi
+    # 3) 常见安装路径
+    for c in /usr/local/bin/reality-checker /usr/bin/reality-checker /root/reality-checker "$HOME/reality-checker"; do
+        if [[ -x "$c" ]]; then echo "$c"; return 0; fi
+    done
+    return 1
+}
+
+# 调用 reality-checker 展示检测结果；未安装时静默跳过
+run_reality_checker() {
+    local domain="$1"
+    local bin=""
+
+    bin=$(find_reality_checker) || bin=""
+    if [[ -z "$bin" ]]; then
+        info "未检测到 reality-checker，跳过第三方检测。"
+        info "如需更完整的评估（CDN/被墙/热门度），可从以下地址安装："
+        info "  ${cyan}https://github.com/V2RaySSR/RealityChecker/releases/latest${none}"
+        return 0
+    fi
+
+    info "使用 reality-checker 检测: ${cyan}${bin}${none}"
+    local output rc=0
+    # 只取 stdout：2>/dev/null 避免 stderr 日志混入表格导致边框错位
+    # timeout 60：该工具会做被墙/GeoIP/CDN 多轮网络请求，防止无限等待
+    output=$(timeout 60 "$bin" check "$domain" 2>/dev/null) || rc=$?
+
+    if [[ "$rc" == 124 ]]; then
+        warning "reality-checker 执行超时（60s），已跳过（不影响安装）。"
+        return 0
+    fi
+    if [[ -z "$output" ]]; then
+        warning "reality-checker 无输出，跳过（不影响安装）。"
+        return 0
+    fi
+
+    # 展示结果（限制行数，避免刷屏）
+    echo "$output" | sed -n '1,40p'
+    if [[ "$rc" != 0 ]]; then
+        warning "reality-checker 退出码非 0（${rc}），结果仅供参考。"
+    fi
+    info "注意：若「最终域名」与输入的 SNI 不同，说明目标发生了重定向；"
+    info "REALITY 的 SNI 必须与证书域名匹配，请自行确认该重定向是否影响握手。"
+    return 0
+}
+
 # 用 xray tls ping 校验 SNI 是否被目标接受（用目标真实 IP，不要用 1.1.1.1）
+# 参数: $1=域名  $2=是否运行 reality-checker(true|false, 默认 false)
 # 返回 0 = 可用；1 = with SNI 握手失败，目标不可用作 REALITY target
 # 结果通过全局变量 SNI_PQV / SNI_CHAIN_LEN 回传给调用方，用于决定是否询问 mldsa65
+#
+# 注意：reality-checker 会做多轮网络请求，耗时可达数十秒，因此仅在用户交互输入
+# SNI 时显示（with_checker=true）；安装后的补测、改配置时的重复探测均只做 tls ping。
 SNI_PQV=false
 SNI_CHAIN_LEN=""
 
 check_sni_target() {
     local domain="$1"
+    local with_checker="${2:-false}"
     SNI_PQV=false
     SNI_CHAIN_LEN=""
-    [[ -x "$xray_binary_path" ]] || return 0
+    local ping_ok=true
 
-    local target_ip output
-    target_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}') || target_ip=""
-    if [[ -z "$target_ip" ]]; then
-        warning "无法解析 $domain 的 IPv4 地址，跳过 SNI 探活。"
-        return 0
-    fi
-
-    info "正在探测目标: $domain ($target_ip)"
-    output=$("$xray_binary_path" tls ping "$domain" --ip "$target_ip" 2>&1) || true
-    echo "$output" | sed -n '1,24p'
-
-    if ! echo "$output" | grep -q "Handshake succeeded"; then
-        error "目标 $domain 与该 SNI 握手失败，REALITY 会表现为连不上！"
-        warning "请换单站域名（避开 *.pantheon.io / *.pages.dev / *.vercel.app 等多租户托管）。"
-        return 1
-    fi
-
-    if echo "$output" | grep -q "TLS Post-Quantum key exchange:[[:space:]]*true"; then
-        SNI_PQV=true
-    fi
-    SNI_CHAIN_LEN=$(echo "$output" | grep "Certificate chain's total length" | head -n 1 | awk '{print $5}') || SNI_CHAIN_LEN=""
-    info "SNI 探活通过。后量子密钥交换: ${cyan}${SNI_PQV}${none}${SNI_CHAIN_LEN:+, 证书链长度: ${cyan}${SNI_CHAIN_LEN}${none}}"
-
-    if [[ "$SNI_PQV" = true ]]; then
-        if [[ -n "$SNI_CHAIN_LEN" && "$SNI_CHAIN_LEN" -gt 3500 ]]; then
-            info "该目标可启用 mldsa65 抗量子签名（安装时可选择，默认不启用）。"
+    # --- 第一部分：xray tls ping（毫秒级，始终执行） ---
+    if [[ -x "$xray_binary_path" ]]; then
+        local target_ip output
+        target_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}') || target_ip=""
+        if [[ -z "$target_ip" ]]; then
+            warning "无法解析 $domain 的 IPv4 地址，跳过 tls ping 探活。"
         else
-            warning "该目标支持后量子密钥交换，但证书链不足 3501，不建议启用 mldsa65。"
+            draw_divider
+            echo -e "${cyan} [ 目标探测: xray tls ping → ${domain} (${target_ip}) ]${none}"
+            output=$("$xray_binary_path" tls ping "$domain" --ip "$target_ip" 2>&1) || true
+            echo "$output" | sed -n '1,24p'
+
+            if ! echo "$output" | grep -q "Handshake succeeded"; then
+                ping_ok=false
+                error "目标 $domain 与该 SNI 握手失败，REALITY 会表现为连不上！"
+                warning "请换单站域名（避开 *.pantheon.io / *.pages.dev / *.vercel.app 等多租户托管）。"
+            else
+                if echo "$output" | grep -q "TLS Post-Quantum key exchange:[[:space:]]*true"; then
+                    SNI_PQV=true
+                fi
+                SNI_CHAIN_LEN=$(echo "$output" | grep "Certificate chain's total length" | head -n 1 | awk '{print $5}') || SNI_CHAIN_LEN=""
+                info "SNI 探活通过。后量子密钥交换: ${cyan}${SNI_PQV}${none}${SNI_CHAIN_LEN:+, 证书链长度: ${cyan}${SNI_CHAIN_LEN}${none}}"
+
+                if [[ "$SNI_PQV" = true ]]; then
+                    if [[ -n "$SNI_CHAIN_LEN" && "$SNI_CHAIN_LEN" -gt 3500 ]]; then
+                        info "该目标可启用 mldsa65 抗量子签名（安装时可选择，默认不启用）。"
+                    else
+                        warning "该目标支持后量子密钥交换，但证书链不足 3501，不建议启用 mldsa65。"
+                    fi
+                else
+                    info "该目标不支持后量子密钥交换，使用标准 x25519（无需 mldsa65）。"
+                fi
+            fi
         fi
     else
-        info "该目标不支持后量子密钥交换，使用标准 x25519（无需 mldsa65）。"
+        info "xray 尚未安装，跳过 tls ping 探活（安装完成后会补测）。"
     fi
-    return 0
+
+    # --- 第二部分：reality-checker 第三方检测（仅交互输入 SNI 时展示，避免重复耗时） ---
+    if [[ "$with_checker" == true ]]; then
+        draw_divider
+        run_reality_checker "$domain"
+        draw_divider
+    fi
+
+    [[ "$ping_ok" == true ]] && return 0 || return 1
 }
 
 prompt_for_vless_config() {
@@ -592,7 +786,7 @@ prompt_for_vless_config() {
             error "域名格式无效，请重新输入。"
             continue
         fi
-        if check_sni_target "$p_sni"; then break; fi
+        if check_sni_target "$p_sni" true; then break; fi
         warning "目标不接受该 SNI，请换一个域名后重试。"
     done
     info "SNI 域名将使用: ${cyan}${p_sni}${none}"
@@ -714,6 +908,8 @@ add_ss_to_vless() {
 
     if ! restart_xray; then return 1; fi
 
+    open_extra_port "$ss_port" "Shadowsocks"
+
     success "追加安装成功！"
     view_all_info
 }
@@ -730,8 +926,12 @@ add_vless_to_ss() {
     default_vless_port=$([[ "$ss_port" == "8388" ]] && echo "443" || echo "$((ss_port - 1))")
 
     prompt_for_vless_config vless_port vless_uuid vless_domain "$default_vless_port"
-    read -p "$(echo -e " -> 请输入内部转发端口 (防盗刷, 默认: ${cyan}23333${none}): ")" internal_port || true
-    [[ -z "$internal_port" ]] && internal_port=23333
+    prompt_for_dokodemo no false
+    if [[ "$USE_DOKODEMO" == true ]]; then
+        prompt_for_internal_port internal_port 23333 23333
+    else
+        internal_port=""
+    fi
     # 确保 SNI_PQV/SNI_CHAIN_LEN 为本次所选域名的最新探测结果
     check_sni_target "$vless_domain" || warning "SNI 探活未通过，仍继续安装；如连不上请更换域名。"
 
@@ -758,9 +958,13 @@ add_vless_to_ss() {
         prompt_for_fallback_limit
     fi
 
-    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT")
+    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT" "$use_dokodemo")
     dokodemo_inbound=$(build_dokodemo_inbound "$vless_domain" "$internal_port")
-    write_config "[$dokodemo_inbound, $vless_inbound, $ss_inbound]" "$vless_domain"
+    if [[ "$use_dokodemo" == true ]]; then
+        write_config "[$dokodemo_inbound, $vless_inbound, $ss_inbound]" "$vless_domain"
+    else
+        write_config "[$vless_inbound, $ss_inbound]"
+    fi
 
     if ! restart_xray; then return 1; fi
 
@@ -774,8 +978,12 @@ install_vless_only() {
     info "开始配置 VLESS-Reality..."
     local port uuid domain internal_port
     prompt_for_vless_config port uuid domain
-    read -p "$(echo -e " -> 请输入内部转发端口 (防盗刷, 默认: ${cyan}23333${none}): ")" internal_port || true
-    [[ -z "$internal_port" ]] && internal_port=23333
+    prompt_for_dokodemo no false
+    if [[ "$USE_DOKODEMO" == true ]]; then
+        prompt_for_internal_port internal_port 23333 23333
+    else
+        internal_port=""
+    fi
     run_install_vless "$port" "$uuid" "$domain" "$internal_port"
 }
 
@@ -790,8 +998,12 @@ install_dual() {
     info "开始配置双协议 (VLESS-Reality + Shadowsocks-2022)..."
     local vless_port vless_uuid vless_domain ss_port ss_password internal_port
     prompt_for_vless_config vless_port vless_uuid vless_domain
-    read -p "$(echo -e " -> 请输入内部转发端口 (防盗刷, 默认: ${cyan}23333${none}): ")" internal_port || true
-    [[ -z "$internal_port" ]] && internal_port=23333
+    prompt_for_dokodemo no false
+    if [[ "$USE_DOKODEMO" == true ]]; then
+        prompt_for_internal_port internal_port 23333 23333
+    else
+        internal_port=""
+    fi
 
     local default_ss_port
     if [[ "$vless_port" == "443" ]]; then
@@ -905,10 +1117,11 @@ uninstall_xray() {
     fi
 
     # 先读取端口，卸载后配置文件会被删除
-    local vless_port="" internal_port=""
+    local vless_port="" internal_port="" ss_port=""
     if [[ -f "$xray_config_path" ]]; then
         vless_port=$(jq -r '.inbounds[] | select(.protocol == "vless") | .port' "$xray_config_path" 2>/dev/null || true)
         internal_port=$(jq -r '.inbounds[] | select(.tag == "dokodemo-in") | .port' "$xray_config_path" 2>/dev/null || true)
+        ss_port=$(jq -r '.inbounds[] | select(.protocol == "shadowsocks") | .port' "$xray_config_path" 2>/dev/null || true)
     fi
 
     info "正在卸载 Xray..."
@@ -919,13 +1132,12 @@ uninstall_xray() {
 
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
         info "正在清理防火墙规则..."
-        if [[ -n "$vless_port" ]]; then
-            firewall-cmd --permanent --remove-port="${vless_port}/tcp" >/dev/null 2>&1 || true
-        fi
-        if [[ -n "$internal_port" ]]; then
-            firewall-cmd --permanent --remove-port="${internal_port}/tcp" >/dev/null 2>&1 || true
-        fi
+        [[ -n "$vless_port" ]] && firewall-cmd --permanent --remove-port="${vless_port}/tcp" >/dev/null 2>&1 || true
+        [[ -n "$internal_port" ]] && firewall-cmd --permanent --remove-port="${internal_port}/tcp" >/dev/null 2>&1 || true
+        [[ -n "$ss_port" ]] && firewall-cmd --permanent --remove-port="${ss_port}/tcp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
+        warning "提示：以上仅清理当前配置中的端口。若你曾用旧版脚本改过端口，"
+        warning "可能仍有历史端口残留，请执行 firewall-cmd --list-ports 自行确认。"
     fi
 
     rm -f ~/xray_subscription_info.txt
@@ -1016,7 +1228,7 @@ modify_config_menu() {
 
 modify_vless_config() {
     info "开始修改 VLESS-Reality 配置..."
-    local vless_inbound current_port current_uuid current_domain current_internal_port private_key public_key port uuid domain internal_port new_vless_inbound dokodemo_inbound ss_inbound new_inbounds current_seed mldsa65_seed="" mldsa65_verify=""
+    local vless_inbound current_port current_uuid current_domain private_key public_key port uuid domain internal_port new_vless_inbound dokodemo_inbound ss_inbound new_inbounds current_seed mldsa65_seed="" mldsa65_verify=""
     vless_inbound=$(jq '.inbounds[] | select(.protocol == "vless")' "$xray_config_path")
     current_port=$(echo "$vless_inbound" | jq -r '.port')
     current_uuid=$(echo "$vless_inbound" | jq -r '.settings.clients[0].id')
@@ -1026,7 +1238,13 @@ modify_vless_config() {
     # 保留既有 mldsa65Seed，避免修改端口/SNI 时丢失
     current_seed=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.mldsa65Seed // empty' 2>/dev/null || true)
     mldsa65_seed="$current_seed"
-    current_internal_port=$(jq -r '.inbounds[] | select(.tag == "dokodemo-in") | .port' "$xray_config_path" 2>/dev/null || echo "23333")
+
+    # 读取当前 dokodemo 状态与内部端口
+    local cur_dokodemo=false cur_internal_port=""
+    if has_dokodemo; then
+        cur_dokodemo=true
+        cur_internal_port=$(jq -r '.inbounds[] | select(.tag == "dokodemo-in") | .port' "$xray_config_path" 2>/dev/null || echo "23333")
+    fi
 
     while true; do
         read -p "$(echo -e " -> 新端口 (当前: ${cyan}${current_port}${none}, 留空不改): ")" port || true
@@ -1045,15 +1263,26 @@ modify_vless_config() {
             continue
         fi
         if [[ "$domain" == "$current_domain" ]]; then
-            # 未改域名：重新探活一次以便询问 mldsa65
-            check_sni_target "$domain" || true
+            # 未改域名：仅在没有 mldsa65 时才需要探测（为后续询问准备 SNI_PQV/SNI_CHAIN_LEN）
+            if [[ -z "$mldsa65_seed" ]]; then
+                check_sni_target "$domain" || true
+            fi
             break
         fi
-        if check_sni_target "$domain"; then break; fi
+        if check_sni_target "$domain" true; then break; fi
         warning "目标不接受该 SNI，请换一个域名后重试。"
     done
-    read -p "$(echo -e " -> 内部转发端口 (防盗刷, 当前: ${cyan}${current_internal_port}${none}, 留空不改): ")" internal_port || true
-    [[ -z "$internal_port" ]] && internal_port=$current_internal_port
+
+    # 防盗刷开关：留空保持现状，y 启用，n 关闭
+    prompt_for_dokodemo no true
+    local use_dokodemo="$USE_DOKODEMO"
+    if [[ "$use_dokodemo" == true ]]; then
+        local new_internal_port
+        prompt_for_internal_port new_internal_port "${cur_internal_port:-23333}" 23333
+        internal_port="$new_internal_port"
+    else
+        internal_port=""
+    fi
 
     # 仅当当前未启用 mldsa65 时才询问是否新增启用
     if [[ -z "$mldsa65_seed" ]]; then
@@ -1089,16 +1318,29 @@ modify_vless_config() {
         fi
     fi
 
-    new_vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT")
-    dokodemo_inbound=$(build_dokodemo_inbound "$domain" "$internal_port")
+    new_vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT" "$use_dokodemo")
     ss_inbound=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$xray_config_path" 2>/dev/null || true)
-    new_inbounds="[$dokodemo_inbound, $new_vless_inbound]"
-    [[ -n "$ss_inbound" ]] && new_inbounds="[$dokodemo_inbound, $new_vless_inbound, $ss_inbound]"
-
-    write_config "$new_inbounds" "$domain"
+    if [[ "$use_dokodemo" == true ]]; then
+        dokodemo_inbound=$(build_dokodemo_inbound "$domain" "$internal_port")
+        new_inbounds="[$dokodemo_inbound, $new_vless_inbound]"
+        [[ -n "$ss_inbound" ]] && new_inbounds="[$dokodemo_inbound, $new_vless_inbound, $ss_inbound]"
+        write_config "$new_inbounds" "$domain"
+    else
+        new_inbounds="[$new_vless_inbound]"
+        [[ -n "$ss_inbound" ]] && new_inbounds="[$new_vless_inbound, $ss_inbound]"
+        write_config "$new_inbounds"
+    fi
     if ! restart_xray; then return 1; fi
 
-    setup_firewalld "$port" "$internal_port"
+    # 防火墙：传入旧端口用于清理，避免端口变更后旧端口残留开放
+    setup_firewalld "$port" "$internal_port" "$current_port" "${cur_internal_port:-}"
+
+    # 关闭防盗刷时提示残留的旧内部端口已清理
+    if [[ "$cur_dokodemo" == true && "$use_dokodemo" == false ]]; then
+        info "防盗刷转发已关闭：dokodemo-door inbound 与 routing 规则已移除。"
+    elif [[ "$cur_dokodemo" == false && "$use_dokodemo" == true ]]; then
+        info "防盗刷转发已启用：dokodemo-door 监听 127.0.0.1:${internal_port}。"
+    fi
 
     success "配置修改成功！"
     view_all_info
@@ -1138,6 +1380,15 @@ modify_ss_config() {
         write_config "[$new_ss_inbound]"
     fi
     if ! restart_xray; then return 1; fi
+
+    # 端口变更时关闭旧端口、开放新端口
+    if [[ "$port" != "$current_port" ]]; then
+        if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+            firewall-cmd --permanent --remove-port="${current_port}/tcp" >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null 2>&1 || true
+        fi
+    fi
+    open_extra_port "$port" "Shadowsocks"
 
     success "配置修改成功！"
     view_all_info
@@ -1238,6 +1489,14 @@ view_all_info() {
                 if [[ -n "$mldsa_verify" ]]; then
                     printf "    %s: ${cyan}%s${none}\n" "ML-DSA-65 Verify (pqv)" "$mldsa_verify"
                 fi
+                local fw_mode dokodemo_port
+                if has_dokodemo; then
+                    dokodemo_port=$(jq -r '.inbounds[] | select(.tag == "dokodemo-in") | .port' "$xray_config_path" 2>/dev/null || echo "?")
+                    fw_mode="启用 (dokodemo-door ${dokodemo_port} + SNI 白名单)"
+                else
+                    fw_mode="关闭 (dest 直连 ${domain}:443)"
+                fi
+                printf "    %s: ${cyan}%s${none}\n" "防盗刷转发" "$fw_mode"
                 local limit_upload
                 limit_upload=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.limitFallbackUpload // empty' 2>/dev/null || true)
                 if [[ -n "$limit_upload" ]]; then
@@ -1334,7 +1593,9 @@ NOTE
 # --- 核心安装逻辑函数 ---
 run_install_vless() {
     local port="$1" uuid="$2" domain="$3" internal_port="$4"
-    [[ -z "$internal_port" ]] && internal_port=23333
+    # 空 internal_port 表示未启用 dokodemo（直连模式），不再赋默认值
+    local use_dokodemo=false
+    [[ -n "$internal_port" ]] && use_dokodemo=true
     if [[ -z "$(get_public_ip)" ]]; then
         error "无法获取公网 IP 地址，安装中止。请检查您的网络连接。"
         exit 1
@@ -1358,9 +1619,13 @@ run_install_vless() {
     fi
     prompt_for_fallback_limit
 
-    vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT")
-    dokodemo_inbound=$(build_dokodemo_inbound "$domain" "$internal_port")
-    write_config "[$dokodemo_inbound, $vless_inbound]" "$domain"
+    vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT" "$use_dokodemo")
+    if [[ "$use_dokodemo" == true ]]; then
+        dokodemo_inbound=$(build_dokodemo_inbound "$domain" "$internal_port")
+        write_config "[$dokodemo_inbound, $vless_inbound]" "$domain"
+    else
+        write_config "[$vless_inbound]"
+    fi
 
     if ! restart_xray; then exit 1; fi
 
@@ -1389,7 +1654,9 @@ run_install_ss() {
 
 run_install_dual() {
     local vless_port="$1" vless_uuid="$2" vless_domain="$3" ss_port="$4" ss_password="$5" internal_port="$6"
-    [[ -z "$internal_port" ]] && internal_port=23333
+    # 空 internal_port 表示未启用 dokodemo（直连模式）
+    local use_dokodemo=false
+    [[ -n "$internal_port" ]] && use_dokodemo=true
     if [[ -z "$(get_public_ip)" ]]; then
         error "无法获取公网 IP 地址，安装中止。请检查您的网络连接。"
         exit 1
@@ -1410,15 +1677,21 @@ run_install_dual() {
     if prompt_for_mldsa65 "$vless_domain" "$SNI_PQV" "$SNI_CHAIN_LEN" mldsa65_seed mldsa65_verify; then
         write_mldsa65_verify "$mldsa65_verify"
     fi
+    prompt_for_fallback_limit
 
-    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed")
-    dokodemo_inbound=$(build_dokodemo_inbound "$vless_domain" "$internal_port")
+    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT" "$use_dokodemo")
     ss_inbound=$(build_ss_inbound "$ss_port" "$ss_password")
-    write_config "[$dokodemo_inbound, $vless_inbound, $ss_inbound]" "$vless_domain"
+    if [[ "$use_dokodemo" == true ]]; then
+        dokodemo_inbound=$(build_dokodemo_inbound "$vless_domain" "$internal_port")
+        write_config "[$dokodemo_inbound, $vless_inbound, $ss_inbound]" "$vless_domain"
+    else
+        write_config "[$vless_inbound, $ss_inbound]"
+    fi
 
     if ! restart_xray; then exit 1; fi
 
     setup_firewalld "$vless_port" "$internal_port"
+    open_extra_port "$ss_port"
 
     success "双协议安装成功！"
     view_all_info
