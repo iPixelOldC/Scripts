@@ -2,24 +2,35 @@
 
 # ==============================================================================
 # Xray VLESS-Reality & Shadowsocks 2022 多功能管理脚本
-# 版本: Final v2.9.2 with SNI && FW
-# 更新日志 (v2.9.2): 
-# - [个人修改] 添加SNI校验和防火墙设置，但缺少卸载时的防火墙操作
-# - [安全] 添加配置文件权限保护
-# - [安全] 增强脚本下载验证
-# - [安全] 敏感信息显示保护
-# - [稳定] 网络操作重试机制
-# - [稳定] 服务启动详细错误显示
+# 版本: v2.10.0
+# 更新日志 (v2.10.0):
+# - [新增] mldsa65 抗量子签名：tls ping 探测 pqv + 证书链 >3500 时询问是否启用
+# - [新增] 回落限速 limitFallbackUpload/Download：参数随机化，避免脚本指纹
+# - [新增] 菜单 9「诊断 Xray 安装状态」，一次输出二进制/服务/配置/网络/磁盘状态
+# - [新增] view_all_info 输出客户端兼容提示（Mihomo 需 chrome + ML-KEM 开关）
+# - [修复] 官方安装器输出不再丢弃，失败时回显日志摘要
+# - [修复] update_xray 校验 API 响应、检查 run_core_install 返回值、更新后回读版本
+# - [修复] 回落限速随机数改用 SRANDOM，修正 RANDOM 16 位导致的抖动范围过窄
+# - [修复] 卸载时清理 mldsa65.verify 残留记录
+# - [修复] geosite/geoip 先走官方安装器，失败后询问是否用 wget 从 MetaCubeX 下载
+# - [修复] 核心安装改用 install --without-geodata，避免官方先拉取失败的 Loyalsoldier 源
+# - [修复] SNI target 探活：tls ping 校验 with SNI 必须握手成功，并输出 pqv/证书链长度
+# - [修复] SS2022 分享链接按 SIP002 明文 method:percentEncodedPassword，IPv6 补 []，tag 编码
+# - [修复] get_public_ip 中 ((attempts++)) 在 set -e 下中断函数，导致 IPv6 回退失效
+# - [修复] 卸载时清理本脚本添加的 firewalld 规则
+# - [维护] 清理 shellcheck SC1087/SC2034 告警（颜色变量加花括号、nameref 抑制注释）
 # ==============================================================================
 
 # --- Shell 严格模式 ---
 set -euo pipefail
 
 # --- 全局常量 ---
-readonly SCRIPT_VERSION="Final v2.9.2 with SNI && FW"
+readonly SCRIPT_VERSION="v2.10.0"
 readonly xray_config_path="/usr/local/etc/xray/config.json"
 readonly xray_binary_path="/usr/local/bin/xray"
 readonly xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+readonly xray_dat_dir="/usr/local/share/xray"
+readonly geodata_release_url="https://github.com/MetaCubeX/meta-rules-dat/releases/latest"
 
 # --- 颜色定义 ---
 readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
@@ -30,23 +41,22 @@ xray_status_info=""
 is_quiet=false
 
 # --- 辅助函数 ---
-error() { 
-    echo -e "\n$red[✖] $1$none\n" >&2
-    
-    # 根据错误内容提供简单建议
+error() {
+    echo -e "\n${red}[✖] $1${none}\n" >&2
+
     case "$1" in
-        *"网络"*|*"下载"*) 
-            echo -e "$yellow提示: 检查网络连接或更换DNS$none" >&2 ;;
-        *"权限"*|*"root"*) 
-            echo -e "$yellow提示: 请使用 sudo 运行脚本$none" >&2 ;;
-        *"端口"*) 
-            echo -e "$yellow提示: 尝试使用其他端口号$none" >&2 ;;
+        *"网络"*|*"下载"*)
+            echo -e "${yellow}提示: 检查网络连接或更换DNS${none}" >&2 ;;
+        *"权限"*|*"root"*)
+            echo -e "${yellow}提示: 请使用 sudo 运行脚本${none}" >&2 ;;
+        *"端口"*)
+            echo -e "${yellow}提示: 尝试使用其他端口号${none}" >&2 ;;
     esac
 }
 
-info() { [[ "$is_quiet" = false ]] && echo -e "\n$yellow[!] $1$none\n"; }
-success() { [[ "$is_quiet" = false ]] && echo -e "\n$green[✔] $1$none\n"; }
-warning() { [[ "$is_quiet" = false ]] && echo -e "\n$yellow[⚠] $1$none\n"; }
+info() { [[ "$is_quiet" = false ]] && echo -e "\n${yellow}[!] $1${none}\n" || true; }
+success() { [[ "$is_quiet" = false ]] && echo -e "\n${green}[✔] $1${none}\n" || true; }
+warning() { [[ "$is_quiet" = false ]] && echo -e "\n${yellow}[⚠] $1${none}\n" || true; }
 
 spinner() {
     local pid="$1"
@@ -69,21 +79,23 @@ get_public_ip() {
     local ip
     local attempts=0
     local max_attempts=2
-    
+
     while [[ $attempts -lt $max_attempts ]]; do
         for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
             for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-                ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+                ip=$($cmd "$url" 2>/dev/null) || true
+                if [[ -n "$ip" ]]; then echo "$ip"; return; fi
             done
         done
-        ((attempts++))
-        [[ $attempts -lt $max_attempts ]] && sleep 1
+        attempts=$((attempts + 1))
+        [[ $attempts -lt $max_attempts ]] && sleep 1 || true
     done
-    
+
     # IPv6 fallback
     for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
         for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+            ip=$($cmd "$url" 2>/dev/null) || true
+            if [[ -n "$ip" ]]; then echo "$ip"; return; fi
         done
     done
 }
@@ -120,20 +132,19 @@ check_xray_status() {
     xray_status_info=" Xray 状态: ${green}已安装${none} | ${service_status} | 版本: ${cyan}${xray_version}${none}"
 }
 
-# 新增：快速状态检查
 quick_status() {
     if [[ ! -f "$xray_binary_path" ]]; then
         echo -e " ${red}●${none} 未安装"
         return
     fi
-    
+
     local status_icon
     if systemctl is-active --quiet xray 2>/dev/null; then
         status_icon="${green}●${none}"
     else
         status_icon="${red}●${none}"
     fi
-    
+
     echo -e " $status_icon Xray $(systemctl is-active xray 2>/dev/null || echo "inactive")"
 }
 
@@ -143,9 +154,126 @@ generate_ss_key() {
 }
 
 build_vless_inbound() {
-    local port="$1" uuid="$2" domain="$3" private_key="$4" public_key="$5" internal_port="$6" shortid="94451705"
-    jq -n --argjson port "$port" --arg uuid "$uuid" --arg domain "$domain" --arg private_key "$private_key" --arg public_key "$public_key" --arg shortid "$shortid" --argjson internal_port "$internal_port" \
-    '{ "listen": "0.0.0.0", "port": $port, "protocol": "vless", "settings": {"clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": false, "dest": ("127.0.0.1:" + ($internal_port | tostring)), "xver": 0, "serverNames": [$domain], "privateKey": $private_key, "publicKey": $public_key, "shortIds": [$shortid]}}, "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]} }'
+    # 第 7 个可选参数 mldsa65_seed：为空时使用标准 x25519（向后兼容）
+    # 第 8 个可选参数 fallback_limit：为 "afterBytes,bytesPerSec,burstBytesPerSec" 时写入回落限速
+    local port="$1" uuid="$2" domain="$3" private_key="$4" public_key="$5" internal_port="$6" mldsa65_seed="${7:-}" fallback_limit="${8:-}" shortid="94451705"
+    local limit_json='{}'
+    if [[ -n "$fallback_limit" ]]; then
+        local after_bytes bytes_per_sec burst
+        IFS=',' read -r after_bytes bytes_per_sec burst <<< "$fallback_limit"
+        limit_json=$(jq -n --argjson a "$after_bytes" --argjson b "$bytes_per_sec" --argjson c "$burst" \
+            '{limitFallbackUpload: {afterBytes: $a, bytesPerSec: $b, burstBytesPerSec: $c},
+              limitFallbackDownload: {afterBytes: $a, bytesPerSec: $b, burstBytesPerSec: $c}}')
+    fi
+    jq -n --argjson port "$port" --arg uuid "$uuid" --arg domain "$domain" --arg private_key "$private_key" --arg public_key "$public_key" --arg shortid "$shortid" --argjson internal_port "$internal_port" --arg mldsa65_seed "$mldsa65_seed" --argjson limit_json "$limit_json" \
+    '{"listen": "0.0.0.0", "port": $port, "protocol": "vless", "settings": {"clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": ({"show": false, "dest": ("127.0.0.1:" + ($internal_port | tostring)), "xver": 0, "serverNames": [$domain], "privateKey": $private_key, "publicKey": $public_key, "shortIds": [$shortid]} + (if $mldsa65_seed != "" then {"mldsa65Seed": $mldsa65_seed} else {} end) + $limit_json)}, "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]} }'
+}
+
+# 回落限速参数生成：官方要求脚本随机化，避免全网参数雷同形成指纹
+# 输出到全局变量 FALLBACK_LIMIT，格式 "afterBytes,bytesPerSec,burstBytesPerSec"
+FALLBACK_LIMIT=""
+prompt_for_fallback_limit() {
+    FALLBACK_LIMIT=""
+    local answer
+    warning "回落限速可防止服务器成为他人的加速节点，但官方明确指出：限速本身是一种特征，不建议启用。"
+    echo -e "  ${cyan}适用场景:${none} 偷用的是 Cloudflare 这类免费 CDN 证书（你当前 SNI: archives.harvard.edu 属于此类）"
+    echo -e "  ${cyan}机制:${none} 令牌桶，传输 afterBytes 字节后限速 bytesPerSec，桶容量 burstBytesPerSec"
+    read -p " 是否启用回落限速？[y/N]: " answer || true
+    if [[ ! "$answer" =~ ^[yY]$ ]]; then
+        info "不启用回落限速。"
+        return 0
+    fi
+
+    # 用户可自定义，直接回车用官方示例值并加随机抖动
+    local custom
+    read -p " 自定义参数 \"afterBytes,bytesPerSec,burstBytesPerSec\" (留空=官方示例值+随机抖动): " custom || true
+    if [[ -n "$custom" ]]; then
+        if [[ "$custom" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
+            FALLBACK_LIMIT="$custom"
+            info "将使用自定义限速参数: ${cyan}${FALLBACK_LIMIT}${none}"
+            return 0
+        fi
+        warning "格式无效，改用随机化参数。"
+    fi
+
+    # 基准 10MB/1MB/s/5MB/s，各加 ±20% 抖动避免指纹
+    # SRANDOM 是 32 位（bash 5.1+）；RANDOM 只有 16 位，取模后覆盖不了目标区间
+    local rnd_a rnd_b rnd_c
+    if [[ -n "${SRANDOM:-}" ]]; then
+        rnd_a=$SRANDOM; rnd_b=$SRANDOM; rnd_c=$SRANDOM
+    else
+        # 老版 bash 兜底：用多次 RANDOM 拼出更大的取值范围
+        rnd_a=$(( RANDOM * 61 + RANDOM ))
+        rnd_b=$(( RANDOM * 7 + RANDOM ))
+        rnd_c=$RANDOM
+    fi
+    local jitter_a jitter_b jitter_c
+    jitter_a=$(( (rnd_a % 4000001) + 8388608 ))           # 8MB ~ 12.4MB
+    jitter_b=$(( (rnd_b % 419431) + 838861 ))             # 800KB/s ~ 1.2MB/s
+    jitter_c=$(( jitter_b * ((rnd_c % 3) + 4) ))          # 基准的 4~6 倍
+    FALLBACK_LIMIT="${jitter_a},${jitter_b},${jitter_c}"
+    info "已生成随机化限速参数: ${cyan}${FALLBACK_LIMIT}${none}"
+    info "即: 传输 $(( jitter_a / 1048576 ))MB 后限速 $(( jitter_b / 1024 ))KB/s，突发上限 $(( jitter_c / 1048576 ))MB/s"
+}
+
+# 询问并在用户许可后生成 ML-DSA-65 密钥对（抗量子签名，可选增强）
+# 输出：种子写到 stdout 的上方变量 default_mldsa_seed / default_mldsa_verify
+# 返回 0 表示用户同意启用且生成成功
+prompt_for_mldsa65() {
+    local domain="$1" pqv="$2" chain_len="$3"
+    local -n o_seed="$4" o_verify="$5"
+    o_seed="" o_verify=""
+
+    [[ "$pqv" = true ]] || return 1
+    if [[ -z "$chain_len" || "$chain_len" -le 3500 ]]; then
+        warning "目标证书链 ${chain_len:-未知} 字节，不足 3501，启用 mldsa65 会产生特征，已跳过。"
+        return 1
+    fi
+    [[ -x "$xray_binary_path" ]] || return 1
+
+    local answer
+    warning "该目标支持后量子密钥交换且证书链 ${chain_len} 字节，可启用 ML-DSA-65 抗量子签名。"
+    echo -e "  ${cyan}说明:${none} 服务端写 mldsa65Seed，客户端链接追加 mldsa65Verify；不启用仍可正常连接。"
+    read -p " 是否启用 mldsa65 抗量子签名？[y/N]: " answer || true
+    if [[ ! "$answer" =~ ^[yY]$ ]]; then
+        info "已跳过 mldsa65，使用标准 x25519。"
+        return 1
+    fi
+
+    local key_pair seed verify
+    key_pair=$("$xray_binary_path" mldsa65 2>/dev/null) || { warning "mldsa65 命令执行失败，已跳过。"; return 1; }
+    seed=$(echo "$key_pair" | awk '/Seed:/ {print $2}')
+    verify=$(echo "$key_pair" | awk '/Verify:/ {print $2}')
+    if [[ -z "$seed" || -z "$verify" ]]; then
+        warning "解析 mldsa65 密钥失败，已跳过（保持 x25519）。"
+        return 1
+    fi
+
+    # o_seed / o_verify 是 nameref（local -n），赋值即写入调用方变量。
+    # 工具无法追踪这层间接引用，因此就近抑制 SC2034。
+    # shellcheck disable=SC2034
+    o_seed="$seed"
+    # shellcheck disable=SC2034
+    o_verify="$verify"
+    success "mldsa65 密钥已生成。"
+    return 0
+}
+
+# 由已有 seed 反推 Verify 公钥（用于链接生成时从配置还原 pqv）
+mldsa65_verify_from_seed() {
+    local seed="$1"
+    [[ -x "$xray_binary_path" && -n "$seed" ]] || return 0
+    "$xray_binary_path" mldsa65 -i "$seed" 2>/dev/null | awk '/Verify:/ {print $2}' || true
+}
+
+# 记录 mldsa65 Verify 到 Xray 数据目录旁的受保护文件，供后续链接生成反查
+readonly mldsa65_record_path="/usr/local/etc/xray/mldsa65.verify"
+write_mldsa65_verify() {
+    local verify="$1"
+    [[ -n "$verify" ]] || return 0
+    printf 'mldsa65Verify=%s\n' "$verify" > "$mldsa65_record_path"
+    chmod 600 "$mldsa65_record_path"
+    chown root:root "$mldsa65_record_path"
 }
 
 build_ss_inbound() {
@@ -215,9 +343,9 @@ setup_firewalld() {
 
 write_config() {
     local inbounds_json="$1"
-    local sni="${2:-}"  # optional: when set, add SNI routing + blackhole outbound (防盗刷)
+    local sni="${2:-}"
     local config_content
-    
+
     if [[ -n "$sni" ]]; then
         config_content=$(jq -n --argjson inbounds "$inbounds_json" --arg sni "$sni" \
         '{
@@ -265,66 +393,122 @@ write_config() {
           ]
         }')
     fi
-    
-    # 新增：验证生成的JSON是否有效
+
     if ! echo "$config_content" | jq . >/dev/null 2>&1; then
         error "生成的配置文件格式错误！"
         return 1
     fi
-    
+
     echo "$config_content" > "$xray_config_path"
-    
-    # 修复：设置适当权限，确保 xray 用户可以读取
+
     chmod 644 "$xray_config_path"
     chown root:root "$xray_config_path"
 }
 
 execute_official_script() {
     local args="$1"
-    local script_content
-    
-    # 增强：添加简单的内容检查
-    script_content=$(curl -L "$xray_install_script_url")
+    local script_content log_file pid
+    log_file=$(mktemp /tmp/xray-install.XXXXXX.log 2>/dev/null || echo "/tmp/xray-install.$$.log")
+
+    script_content=$(curl -fsSL --max-time 60 "$xray_install_script_url" 2>/dev/null) || {
+        error "下载 Xray 官方安装脚本失败（网络不可达或 DNS 异常）。"
+        rm -f "$log_file"
+        return 1
+    }
     if [[ -z "$script_content" || ! "$script_content" =~ "install-release" ]]; then
-        error "下载 Xray 官方安装脚本失败或内容异常！请检查网络连接。"
+        error "下载到的官方安装脚本内容异常（可能被劫持或返回了错误页）。"
+        rm -f "$log_file"
         return 1
     fi
-    
-    echo "$script_content" | bash -s -- $args &> /dev/null &
-    spinner $!
-    if ! wait $!; then
+
+    # 不再 &> /dev/null：输出写入日志，失败时回显，便于定位真正原因
+    echo "$script_content" | bash -s -- $args > "$log_file" 2>&1 &
+    pid=$!
+    spinner $pid
+    if ! wait $pid; then
+        error "官方安装器执行失败（参数: ${args}），日志摘要："
+        tail -n 25 "$log_file" >&2
+        info "完整日志保留在: ${cyan}${log_file}${none}"
         return 1
     fi
+    rm -f "$log_file"
+    return 0
 }
 
 run_core_install() {
     info "正在下载并安装 Xray 核心..."
-    if ! execute_official_script "install"; then
+    # --without-geodata: 官方安装器默认会先拉 Loyalsoldier 的 geoip/geosite，
+    # 该源经常失败；这里让官方只装核心，数据文件统一由 install_geodata 处理。
+    if ! execute_official_script "install --without-geodata"; then
         error "Xray 核心安装失败！"
         return 1
     fi
-    
+
+    install_geodata
+
+    success "Xray 核心及数据文件已准备就绪。"
+}
+
+# 数据文件：官方源装不上时，询问是否用 wget 从 MetaCubeX 下载
+install_geodata() {
+    local geosite_url="${geodata_release_url}/download/geosite.dat"
+    local geoip_url="${geodata_release_url}/download/geoip.dat"
+    local need_geosite=false need_geoip=false answer=""
+
     info "正在更新 GeoIP 和 GeoSite 数据文件..."
     if ! execute_official_script "install-geodata"; then
         error "Geo-data 更新失败！"
         info "这通常不影响核心功能，您可以稍后手动更新。"
     fi
-    
-    success "Xray 核心及数据文件已准备就绪。"
+
+    [[ -s "$xray_dat_dir/geosite.dat" ]] || need_geosite=true
+    [[ -s "$xray_dat_dir/geoip.dat" ]] || need_geoip=true
+    if [[ "$need_geosite" = false && "$need_geoip" = false ]]; then
+        return 0
+    fi
+
+    warning "官方数据源未能提供以下文件：${need_geosite:+geosite.dat }${need_geoip:+geoip.dat}"
+    echo -e "  ${cyan}下载源:${none}   https://github.com/MetaCubeX/meta-rules-dat/releases/latest"
+    echo -e "  ${cyan}geosite 地址:${none} ${geosite_url}"
+    echo -e "  ${cyan}geoip 地址:${none}   ${geoip_url}"
+    echo -e "  ${cyan}安装路径:${none}   ${xray_dat_dir}/geosite.dat, ${xray_dat_dir}/geoip.dat"
+    read -p " 是否用 wget 从 MetaCubeX 手动下载？[Y/n]: " answer || true
+    if [[ "$answer" =~ ^[nN]$ ]]; then
+        info "已跳过手动下载，数据文件保持原样。"
+        return 0
+    fi
+
+    mkdir -p "$xray_dat_dir"
+    if [[ "$need_geosite" = true ]]; then
+        echo -e " 正在下载: ${cyan}${geosite_url}${none}"
+        if wget -O "$xray_dat_dir/geosite.dat" "$geosite_url"; then
+            success "geosite.dat 下载成功。"
+        else
+            warning "geosite.dat 下载失败，Xray 仍可运行。"
+            rm -f "$xray_dat_dir/geosite.dat"
+        fi
+    fi
+    if [[ "$need_geoip" = true ]]; then
+        echo -e " 正在下载: ${cyan}${geoip_url}${none}"
+        if wget -O "$xray_dat_dir/geoip.dat" "$geoip_url"; then
+            success "geoip.dat 下载成功。"
+        else
+            warning "geoip.dat 下载失败，Xray 仍可运行。"
+            rm -f "$xray_dat_dir/geoip.dat"
+        fi
+    fi
 }
 
-# --- 输入验证与交互函数 (优化) ---
+# --- 输入验证与交互函数 ---
 is_valid_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
-# 新增：端口可用性检测
 is_port_available() {
     local port="$1"
     is_valid_port "$port" || return 1
-    
-    # 检查端口是否被占用
+
     if ss -tlpn 2>/dev/null | grep -q ":$port "; then
         warning "端口 $port 已被占用，建议选择其他端口"
         return 1
@@ -335,6 +519,53 @@ is_port_available() {
 is_valid_domain() {
     local domain="$1"
     [[ "$domain" =~ ^[a-zA-Z0-9-]{1,63}(\.[a-zA-Z0-9-]{1,63})+$ ]] && [[ "$domain" != *--* ]]
+}
+
+# 用 xray tls ping 校验 SNI 是否被目标接受（用目标真实 IP，不要用 1.1.1.1）
+# 返回 0 = 可用；1 = with SNI 握手失败，目标不可用作 REALITY target
+# 结果通过全局变量 SNI_PQV / SNI_CHAIN_LEN 回传给调用方，用于决定是否询问 mldsa65
+SNI_PQV=false
+SNI_CHAIN_LEN=""
+
+check_sni_target() {
+    local domain="$1"
+    SNI_PQV=false
+    SNI_CHAIN_LEN=""
+    [[ -x "$xray_binary_path" ]] || return 0
+
+    local target_ip output
+    target_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}') || target_ip=""
+    if [[ -z "$target_ip" ]]; then
+        warning "无法解析 $domain 的 IPv4 地址，跳过 SNI 探活。"
+        return 0
+    fi
+
+    info "正在探测目标: $domain ($target_ip)"
+    output=$("$xray_binary_path" tls ping "$domain" --ip "$target_ip" 2>&1) || true
+    echo "$output" | sed -n '1,24p'
+
+    if ! echo "$output" | grep -q "Handshake succeeded"; then
+        error "目标 $domain 与该 SNI 握手失败，REALITY 会表现为连不上！"
+        warning "请换单站域名（避开 *.pantheon.io / *.pages.dev / *.vercel.app 等多租户托管）。"
+        return 1
+    fi
+
+    if echo "$output" | grep -q "TLS Post-Quantum key exchange:[[:space:]]*true"; then
+        SNI_PQV=true
+    fi
+    SNI_CHAIN_LEN=$(echo "$output" | grep "Certificate chain's total length" | head -n 1 | awk '{print $5}') || SNI_CHAIN_LEN=""
+    info "SNI 探活通过。后量子密钥交换: ${cyan}${SNI_PQV}${none}${SNI_CHAIN_LEN:+, 证书链长度: ${cyan}${SNI_CHAIN_LEN}${none}}"
+
+    if [[ "$SNI_PQV" = true ]]; then
+        if [[ -n "$SNI_CHAIN_LEN" && "$SNI_CHAIN_LEN" -gt 3500 ]]; then
+            info "该目标可启用 mldsa65 抗量子签名（安装时可选择，默认不启用）。"
+        else
+            warning "该目标支持后量子密钥交换，但证书链不足 3501，不建议启用 mldsa65。"
+        fi
+    else
+        info "该目标不支持后量子密钥交换，使用标准 x25519（无需 mldsa65）。"
+    fi
+    return 0
 }
 
 prompt_for_vless_config() {
@@ -357,11 +588,15 @@ prompt_for_vless_config() {
     while true; do
         read -p "$(echo -e " -> 请输入SNI域名 (默认: ${cyan}learn.microsoft.com${none}): ")" p_sni || true
         [[ -z "$p_sni" ]] && p_sni="learn.microsoft.com"
-        if is_valid_domain "$p_sni"; then break; else error "域名格式无效，请重新输入。"; fi
+        if ! is_valid_domain "$p_sni"; then
+            error "域名格式无效，请重新输入。"
+            continue
+        fi
+        if check_sni_target "$p_sni"; then break; fi
+        warning "目标不接受该 SNI，请换一个域名后重试。"
     done
     info "SNI 域名将使用: ${cyan}${p_sni}${none}"
 }
-
 prompt_for_ss_config() {
     local -n p_port="$1" p_pass="$2"
     local default_port="${3:-8388}"
@@ -372,11 +607,10 @@ prompt_for_ss_config() {
         if is_port_available "$p_port"; then break; fi
     done
     info "Shadowsocks 端口将使用: ${cyan}${p_port}${none}"
-    
+
     read -p "$(echo -e " -> 请输入 Shadowsocks 密钥 (留空将自动生成): ")" p_pass || true
     if [[ -z "$p_pass" ]]; then
         p_pass=$(generate_ss_key)
-        # 修改：完整显示SS密钥
         info "已为您生成随机密钥: ${cyan}${p_pass}${none}"
     fi
 }
@@ -394,7 +628,7 @@ draw_menu_header() {
     draw_divider
     check_xray_status
     echo -e "${xray_status_info}"
-    quick_status  # 新增快速状态显示
+    quick_status
     draw_divider
 }
 
@@ -409,11 +643,11 @@ install_menu() {
         vless_exists=$(jq '.inbounds[] | select(.protocol == "vless")' "$xray_config_path" 2>/dev/null || true)
         ss_exists=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$xray_config_path" 2>/dev/null || true)
     fi
-    
+
     draw_menu_header
     if [[ -n "$vless_exists" && -n "$ss_exists" ]]; then
         success "您已安装 VLESS-Reality + Shadowsocks-2022 双协议。"
-        info "如需修改，请使用主菜单的"修改配置"选项。\n 如需重装，请先"卸载"后，再重新"安装"。"
+        info "如需修改，请使用主菜单的修改配置选项。如需重装，请先卸载后，再重新安装。"
         return
     elif [[ -n "$vless_exists" && -z "$ss_exists" ]]; then
         info "检测到您已安装 VLESS-Reality"
@@ -468,7 +702,7 @@ add_ss_to_vless() {
     vless_port=$(echo "$vless_inbound" | jq -r '.port')
     vless_domain=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.serverNames[0]')
     default_ss_port=$([[ "$vless_port" == "443" ]] && echo "8388" || echo "$((vless_port + 1))")
-    
+
     prompt_for_ss_config ss_port ss_password "$default_ss_port"
 
     ss_inbound=$(build_ss_inbound "$ss_port" "$ss_password")
@@ -477,9 +711,9 @@ add_ss_to_vless() {
     else
         write_config "[$vless_inbound, $ss_inbound]"
     fi
-    
+
     if ! restart_xray; then return 1; fi
-    
+
     success "追加安装成功！"
     view_all_info
 }
@@ -490,7 +724,7 @@ add_vless_to_ss() {
         error "无法获取公网 IP 地址，操作中止。请检查您的网络连接。"
         return 1
     fi
-    local ss_inbound ss_port default_vless_port vless_port vless_uuid vless_domain internal_port key_pair private_key public_key vless_inbound dokodemo_inbound
+    local ss_inbound ss_port default_vless_port vless_port vless_uuid vless_domain internal_port key_pair private_key public_key vless_inbound dokodemo_inbound mldsa65_seed="" mldsa65_verify=""
     ss_inbound=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$xray_config_path")
     ss_port=$(echo "$ss_inbound" | jq -r '.port')
     default_vless_port=$([[ "$ss_port" == "8388" ]] && echo "443" || echo "$((ss_port - 1))")
@@ -498,6 +732,8 @@ add_vless_to_ss() {
     prompt_for_vless_config vless_port vless_uuid vless_domain "$default_vless_port"
     read -p "$(echo -e " -> 请输入内部转发端口 (防盗刷, 默认: ${cyan}23333${none}): ")" internal_port || true
     [[ -z "$internal_port" ]] && internal_port=23333
+    # 确保 SNI_PQV/SNI_CHAIN_LEN 为本次所选域名的最新探测结果
+    check_sni_target "$vless_domain" || warning "SNI 探活未通过，仍继续安装；如连不上请更换域名。"
 
     info "正在生成 Reality 密钥对..."
     key_pair=$("$xray_binary_path" x25519)
@@ -508,15 +744,28 @@ add_vless_to_ss() {
         error "生成 Reality 密钥对失败！请检查 Xray 核心是否正常，或尝试卸载后重装。"
         exit 1
     fi
-    
-    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port")
+
+    if prompt_for_mldsa65 "$vless_domain" "$SNI_PQV" "$SNI_CHAIN_LEN" mldsa65_seed mldsa65_verify; then
+        write_mldsa65_verify "$mldsa65_verify"
+    fi
+    # 回退时保留已有限速设置
+    local existing_limit
+    existing_limit=$(jq -r '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.limitFallbackUpload) // empty | if . == "" then "" else "\(.afterBytes),\(.bytesPerSec),\(.burstBytesPerSec)" end' "$xray_config_path" 2>/dev/null || true)
+    if [[ -n "$existing_limit" ]]; then
+        FALLBACK_LIMIT="$existing_limit"
+        info "检测到已有回落限速设置，保留: ${cyan}${FALLBACK_LIMIT}${none}"
+    else
+        prompt_for_fallback_limit
+    fi
+
+    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT")
     dokodemo_inbound=$(build_dokodemo_inbound "$vless_domain" "$internal_port")
     write_config "[$dokodemo_inbound, $vless_inbound, $ss_inbound]" "$vless_domain"
-    
+
     if ! restart_xray; then return 1; fi
-    
+
     setup_firewalld "$vless_port" "$internal_port"
-    
+
     success "追加安装成功！"
     view_all_info
 }
@@ -543,37 +792,108 @@ install_dual() {
     prompt_for_vless_config vless_port vless_uuid vless_domain
     read -p "$(echo -e " -> 请输入内部转发端口 (防盗刷, 默认: ${cyan}23333${none}): ")" internal_port || true
     [[ -z "$internal_port" ]] && internal_port=23333
-    
+
     local default_ss_port
     if [[ "$vless_port" == "443" ]]; then
         default_ss_port=8388
     else
         default_ss_port=$((vless_port + 1))
     fi
-    
+
     prompt_for_ss_config ss_port ss_password "$default_ss_port"
-    
+
     run_install_dual "$vless_port" "$vless_uuid" "$vless_domain" "$ss_port" "$ss_password" "$internal_port"
 }
 
 update_xray() {
     if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装。" && return; fi
     info "正在检查最新版本..."
-    local current_version latest_version
-    current_version=$("$xray_binary_path" version | head -n 1 | awk '{print $2}')
-    latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' | sed 's/v//' || echo "")
-    
-    if [[ -z "$latest_version" ]]; then error "获取最新版本号失败，请检查网络或稍后重试。" && return; fi
-    info "当前版本: ${cyan}${current_version}${none}，最新版本: ${cyan}${latest_version}${none}"
-    
-    if [[ "$current_version" == "$latest_version" ]]; then
-        success "您的 Xray 已是最新版本。" && return
+    local current_version latest_version api_resp force=""
+    current_version=$("$xray_binary_path" version 2>/dev/null | head -n 1 | awk '{print $2}')
+
+    # -fSL: HTTP 错误直接失败；--max-time 防止卡死；不再静默吞掉限流/网络错误
+    api_resp=$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' \
+        https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null) || {
+        error "请求 GitHub API 失败（网络不可达，或 API 已限流）。"
+        info "可手动更新: bash -c \"\$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install"
+        return 1
+    }
+    latest_version=$(echo "$api_resp" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+    if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+        error "无法解析最新版本号（GitHub API 可能已限流，未认证请求限制为 60 次/小时）。"
+        info "API 原始响应: $(echo "$api_resp" | head -c 200)"
+        return 1
     fi
-    
-    info "发现新版本，开始更新..."
-    run_core_install
-    if ! restart_xray; then return 1; fi
-    success "Xray 更新成功！"
+
+    info "当前版本: ${cyan}${current_version}${none}，最新版本: ${cyan}${latest_version}${none}"
+
+    if [[ "$current_version" == "$latest_version" ]]; then
+        success "您的 Xray 已是最新版本（${current_version}）。"
+        read -p " 是否强制重装当前版本（用于修复/验证安装链路）？[y/N]: " force || true
+        if [[ ! "$force" =~ ^[yY]$ ]]; then
+            return 0
+        fi
+        info "开始强制重装 ${latest_version}..."
+    else
+        info "发现新版本，开始更新..."
+    fi
+
+    if ! run_core_install; then
+        error "Xray 核心更新失败，版本未变更（当前仍为 ${current_version}）。"
+        return 1
+    fi
+    if ! restart_xray; then
+        error "核心文件已更新，但服务重启失败。请检查: journalctl -u xray -n 50 --no-pager"
+        return 1
+    fi
+
+    # 回读实际版本，避免“看起来成功”
+    local new_version
+    new_version=$("$xray_binary_path" version 2>/dev/null | head -n 1 | awk '{print $2}')
+    if [[ "$new_version" == "$latest_version" ]]; then
+        if [[ "$current_version" == "$latest_version" ]]; then
+            success "重装完成：版本 ${new_version} 未变（安装链路正常）。"
+        else
+            success "Xray 更新成功：${current_version} → ${new_version}"
+        fi
+    else
+        warning "服务已重启，但版本仍为 ${new_version}（预期 ${latest_version}）。"
+        info "PATH 中的 xray: $(command -v xray 2>/dev/null || echo '未找到')"
+        info "实际二进制: ${xray_binary_path}"
+    fi
+}
+
+# 诊断：一次性输出安装链路各环节状态，用于定位“更新无反应”类问题
+diagnose_xray() {
+    draw_menu_header
+    echo -e "${cyan} Xray 安装诊断${none}"
+    draw_divider
+    echo -e " 二进制路径: ${xray_binary_path}"
+    if [[ -x "$xray_binary_path" ]]; then
+        echo -e " 版本: $("$xray_binary_path" version 2>&1 | head -n 1 || echo '执行失败')"
+        echo -e " 二进制修改时间: $(stat -c '%y' "$xray_binary_path" 2>/dev/null || echo '未知')"
+        echo -e " 二进制大小: $(stat -c '%s' "$xray_binary_path" 2>/dev/null || echo '未知') 字节"
+    else
+        echo -e " ${red}未找到可执行的 xray${none}"
+    fi
+    echo -e " PATH 中的 xray: $(command -v xray 2>/dev/null || echo '未找到')"
+    echo -e " 服务状态: $(systemctl is-active xray 2>/dev/null || echo 'inactive')"
+    echo -e " 配置文件: $([[ -f "$xray_config_path" ]] && echo '存在' || echo '缺失')"
+    if [[ -f "$xray_config_path" && -x "$xray_binary_path" ]]; then
+        if "$xray_binary_path" run -test -c "$xray_config_path" >/dev/null 2>&1; then
+            echo -e " 配置校验: ${green}通过${none}"
+        else
+            echo -e " 配置校验: ${red}失败${none}"
+        fi
+    fi
+    echo -e " GitHub API: $(curl -fsS --max-time 8 https://api.github.com/rate_limit >/dev/null 2>&1 && echo -e "${green}可达${none}" || echo -e "${red}不可达${none}")"
+    echo -e " 安装脚本: $(curl -fsS --max-time 8 -o /dev/null -w '%{http_code}' "$xray_install_script_url" 2>/dev/null || echo '失败')"
+    echo -e " geosite.dat: $([[ -s "$xray_dat_dir/geosite.dat" ]] && echo "存在 ($(stat -c%s "$xray_dat_dir/geosite.dat") 字节)" || echo -e "${red}缺失${none}")"
+    echo -e " geoip.dat: $([[ -s "$xray_dat_dir/geoip.dat" ]] && echo "存在 ($(stat -c%s "$xray_dat_dir/geoip.dat") 字节)" || echo -e "${red}缺失${none}")"
+    echo -e " 磁盘剩余: $(df -h / | awk 'NR==2 {print $4}')"
+    draw_divider
+    info "若 API 不可达但安装脚本可达，可手动执行:"
+    info "bash -c \"\$(curl -fsSL ${xray_install_script_url})\" @ install"
 }
 
 uninstall_xray() {
@@ -583,22 +903,97 @@ uninstall_xray() {
         info "操作已取消。"
         return
     fi
+
+    # 先读取端口，卸载后配置文件会被删除
+    local vless_port="" internal_port=""
+    if [[ -f "$xray_config_path" ]]; then
+        vless_port=$(jq -r '.inbounds[] | select(.protocol == "vless") | .port' "$xray_config_path" 2>/dev/null || true)
+        internal_port=$(jq -r '.inbounds[] | select(.tag == "dokodemo-in") | .port' "$xray_config_path" 2>/dev/null || true)
+    fi
+
     info "正在卸载 Xray..."
     if ! execute_official_script "remove --purge"; then
         error "Xray 卸载失败！"
         return 1
     fi
+
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+        info "正在清理防火墙规则..."
+        if [[ -n "$vless_port" ]]; then
+            firewall-cmd --permanent --remove-port="${vless_port}/tcp" >/dev/null 2>&1 || true
+        fi
+        if [[ -n "$internal_port" ]]; then
+            firewall-cmd --permanent --remove-port="${internal_port}/tcp" >/dev/null 2>&1 || true
+        fi
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
     rm -f ~/xray_subscription_info.txt
+    # 清理本脚本自建的文件（官方 remove --purge 未必覆盖自定义文件）
+    rm -f "$mldsa65_record_path"
     success "Xray 已成功卸载。"
+}
+
+# 关闭 mldsa65：删除 mldsa65Seed，回到纯 x25519（不改 UUID/端口/SNI/密钥）
+disable_mldsa65() {
+    if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装。" && return; fi
+
+    local seed
+    seed=$(jq -r '.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.mldsa65Seed // empty' "$xray_config_path" 2>/dev/null || true)
+    if [[ -z "$seed" ]]; then
+        info "当前未启用 mldsa65，无需回退。"
+        return 0
+    fi
+
+    warning "将删除 mldsa65Seed，回到标准 x25519 REALITY。"
+    info "其它配置（UUID / 端口 / SNI / 密钥 / Shadowsocks）保持不变。"
+    read -p " 确认关闭 mldsa65？[y/N]: " confirm || true
+    if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+        info "操作已取消。"
+        return 0
+    fi
+
+    local tmp_config
+    tmp_config=$(mktemp)
+    if ! jq '(.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings) |= del(.mldsa65Seed)' \
+        "$xray_config_path" > "$tmp_config"; then
+        rm -f "$tmp_config"
+        error "生成新配置失败，原配置未改动。"
+        return 1
+    fi
+
+    local vless_domain
+    vless_domain=$(jq -r '.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.serverNames[0]' "$tmp_config" 2>/dev/null || true)
+    local ss_exists
+    ss_exists=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$tmp_config" 2>/dev/null || true)
+    if [[ -z "$vless_domain" ]]; then
+        rm -f "$tmp_config"
+        error "读取 SNI 失败，原配置未改动。"
+        return 1
+    fi
+
+    mv "$tmp_config" "$xray_config_path"
+    chmod 644 "$xray_config_path"
+    chown root:root "$xray_config_path"
+    if [[ -n "$ss_exists" ]]; then
+        info "Shadowsocks 配置已保留。"
+    fi
+
+    rm -f "$mldsa65_record_path"
+
+    if ! restart_xray; then return 1; fi
+
+    success "mldsa65 已关闭，realitySettings 仅保留 x25519。"
+    view_all_info
 }
 
 modify_config_menu() {
     if [[ ! -f "$xray_config_path" ]]; then error "错误: Xray 未安装。" && return; fi
-    
+
     local vless_exists="" ss_exists=""
     vless_exists=$(jq '.inbounds[] | select(.protocol == "vless")' "$xray_config_path" 2>/dev/null || true)
     ss_exists=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$xray_config_path" 2>/dev/null || true)
-    
+
     if [[ -n "$vless_exists" && -n "$ss_exists" ]]; then
         draw_menu_header
         echo -e "${cyan} 请选择要修改的协议配置${none}"
@@ -621,15 +1016,18 @@ modify_config_menu() {
 
 modify_vless_config() {
     info "开始修改 VLESS-Reality 配置..."
-    local vless_inbound current_port current_uuid current_domain current_internal_port private_key public_key port uuid domain internal_port new_vless_inbound dokodemo_inbound ss_inbound new_inbounds
+    local vless_inbound current_port current_uuid current_domain current_internal_port private_key public_key port uuid domain internal_port new_vless_inbound dokodemo_inbound ss_inbound new_inbounds current_seed mldsa65_seed="" mldsa65_verify=""
     vless_inbound=$(jq '.inbounds[] | select(.protocol == "vless")' "$xray_config_path")
     current_port=$(echo "$vless_inbound" | jq -r '.port')
     current_uuid=$(echo "$vless_inbound" | jq -r '.settings.clients[0].id')
     current_domain=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.serverNames[0]')
     private_key=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.privateKey')
     public_key=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.publicKey')
+    # 保留既有 mldsa65Seed，避免修改端口/SNI 时丢失
+    current_seed=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.mldsa65Seed // empty' 2>/dev/null || true)
+    mldsa65_seed="$current_seed"
     current_internal_port=$(jq -r '.inbounds[] | select(.tag == "dokodemo-in") | .port' "$xray_config_path" 2>/dev/null || echo "23333")
-    
+
     while true; do
         read -p "$(echo -e " -> 新端口 (当前: ${cyan}${current_port}${none}, 留空不改): ")" port || true
         [[ -z "$port" ]] && port=$current_port
@@ -638,21 +1036,65 @@ modify_vless_config() {
 
     read -p "$(echo -e " -> 新UUID (当前: ${cyan}${current_uuid}${none}, 留空不改): ")" uuid || true
     [[ -z "$uuid" ]] && uuid=$current_uuid
-    
+
     while true; do
         read -p "$(echo -e " -> 新SNI域名 (当前: ${cyan}${current_domain}${none}, 留空不改): ")" domain || true
         [[ -z "$domain" ]] && domain=$current_domain
-        if is_valid_domain "$domain"; then break; else error "域名格式无效，请重新输入。"; fi
+        if ! is_valid_domain "$domain"; then
+            error "域名格式无效，请重新输入。"
+            continue
+        fi
+        if [[ "$domain" == "$current_domain" ]]; then
+            # 未改域名：重新探活一次以便询问 mldsa65
+            check_sni_target "$domain" || true
+            break
+        fi
+        if check_sni_target "$domain"; then break; fi
+        warning "目标不接受该 SNI，请换一个域名后重试。"
     done
     read -p "$(echo -e " -> 内部转发端口 (防盗刷, 当前: ${cyan}${current_internal_port}${none}, 留空不改): ")" internal_port || true
     [[ -z "$internal_port" ]] && internal_port=$current_internal_port
-    
-    new_vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port")
+
+    # 仅当当前未启用 mldsa65 时才询问是否新增启用
+    if [[ -z "$mldsa65_seed" ]]; then
+        if prompt_for_mldsa65 "$domain" "$SNI_PQV" "$SNI_CHAIN_LEN" mldsa65_seed mldsa65_verify; then
+            write_mldsa65_verify "$mldsa65_verify"
+        fi
+    else
+        info "检测到已启用 mldsa65，保留现有配置。"
+    fi
+
+    # 回落限速：显示当前状态，允许保留/修改/清除
+    FALLBACK_LIMIT=""
+    local cur_limit cur_after cur_rate cur_burst
+    cur_limit=$(jq -r '.inbounds[] | select(.protocol == "vless") | .streamSettings.realitySettings.limitFallbackUpload // empty' "$xray_config_path" 2>/dev/null || true)
+    if [[ -n "$cur_limit" ]]; then
+        cur_after=$(echo "$cur_limit" | jq -r '.afterBytes')
+        cur_rate=$(echo "$cur_limit" | jq -r '.bytesPerSec')
+        cur_burst=$(echo "$cur_limit" | jq -r '.burstBytesPerSec')
+        info "当前回落限速: afterBytes=${cur_after}, bytesPerSec=${cur_rate}, burstBytesPerSec=${cur_burst}"
+        local limit_choice
+        read -p " 回落限速 [1=保留 2=重新设置 3=关闭] (默认1): " limit_choice || true
+        case "$limit_choice" in
+            2) prompt_for_fallback_limit ;;
+            3) info "将关闭回落限速。"; FALLBACK_LIMIT="" ;;
+            *) FALLBACK_LIMIT="${cur_after},${cur_rate},${cur_burst}"; info "保留现有限速设置。" ;;
+        esac
+    else
+        read -p "$(echo -e " -> 是否启用回落限速？[y/N]: ")" enable_limit || true
+        if [[ "$enable_limit" =~ ^[yY]$ ]]; then
+            prompt_for_fallback_limit
+        else
+            FALLBACK_LIMIT=""
+        fi
+    fi
+
+    new_vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT")
     dokodemo_inbound=$(build_dokodemo_inbound "$domain" "$internal_port")
     ss_inbound=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$xray_config_path" 2>/dev/null || true)
     new_inbounds="[$dokodemo_inbound, $new_vless_inbound]"
     [[ -n "$ss_inbound" ]] && new_inbounds="[$dokodemo_inbound, $new_vless_inbound, $ss_inbound]"
-    
+
     write_config "$new_inbounds" "$domain"
     if ! restart_xray; then return 1; fi
 
@@ -668,22 +1110,24 @@ modify_ss_config() {
     ss_inbound=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$xray_config_path")
     current_port=$(echo "$ss_inbound" | jq -r '.port')
     current_password=$(echo "$ss_inbound" | jq -r '.settings.password')
-    
+
     while true; do
         read -p "$(echo -e " -> 新端口 (当前: ${cyan}${current_port}${none}, 留空不改): ")" port || true
         [[ -z "$port" ]] && port=$current_port
         if is_port_available "$port" || [[ "$port" == "$current_port" ]]; then break; fi
     done
 
-    # 修改：完整显示当前SS密钥
     read -p "$(echo -e " -> 新密钥 (当前: ${cyan}${current_password}${none}, 留空不改): ")" password || true
     [[ -z "$password" ]] && password=$current_password
-    
+
     new_ss_inbound=$(build_ss_inbound "$port" "$password")
     vless_inbound=$(jq '.inbounds[] | select(.protocol == "vless")' "$xray_config_path" 2>/dev/null || true)
     dokodemo_inbound=$(jq '.inbounds[] | select(.tag == "dokodemo-in")' "$xray_config_path" 2>/dev/null || true)
-    vless_domain=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.serverNames[0]' 2>/dev/null || true)
-    
+    vless_domain=""
+    if [[ -n "$vless_inbound" ]]; then
+        vless_domain=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.serverNames[0]')
+    fi
+
     if [[ -n "$dokodemo_inbound" ]]; then
         new_inbounds="[$dokodemo_inbound, $vless_inbound, $new_ss_inbound]"
         write_config "$new_inbounds" "$vless_domain"
@@ -701,17 +1145,15 @@ modify_ss_config() {
 
 restart_xray() {
     if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装。" && return 1; fi
-    
+
     info "正在重启 Xray 服务..."
     if ! systemctl restart xray; then
         error "尝试重启 Xray 服务失败！"
-        # 新增：显示详细错误信息
         echo -e "\n${yellow}错误详情:${none}"
         systemctl status xray --no-pager -l | tail -5
         return 1
     fi
-    
-    # 等待时间稍微延长，确保服务完全启动
+
     sleep 2
     if systemctl is-active --quiet xray; then
         success "Xray 服务已成功重启！"
@@ -734,7 +1176,7 @@ view_all_info() {
         error "错误: 配置文件不存在。"
         return
     fi
-    
+
     [[ "$is_quiet" = false ]] && clear && echo -e "${cyan} Xray 配置及订阅信息${none}" && draw_divider
 
     local ip
@@ -745,25 +1187,39 @@ view_all_info() {
     fi
     local host
     host=$(hostname)
-    local links_array=()
+    local -a links_array=()
 
     local vless_inbound
     vless_inbound=$(jq '.inbounds[] | select(.protocol == "vless")' "$xray_config_path" 2>/dev/null || true)
     if [[ -n "$vless_inbound" ]]; then
-        local uuid port domain public_key shortid display_ip link_name_raw link_name_encoded vless_url
+        local uuid port domain public_key shortid display_ip link_name_raw link_name_encoded vless_url mldsa_verify pqv_param
         uuid=$(echo "$vless_inbound" | jq -r '.settings.clients[0].id')
         port=$(echo "$vless_inbound" | jq -r '.port')
         domain=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.serverNames[0]')
         public_key=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.publicKey')
         shortid=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
-        
+        mldsa_verify=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.mldsa65Verify // empty' 2>/dev/null || true)
+        # 服务端存 mldsa65Seed，客户端链接要用对应的 mldsa65Verify（pqv 参数）
+        if [[ -z "$mldsa_verify" && -f "$mldsa65_record_path" ]]; then
+            mldsa_verify=$(sed -n 's/^mldsa65Verify=//p' "$mldsa65_record_path" 2>/dev/null | head -n 1)
+        fi
+        if [[ -z "$mldsa_verify" ]]; then
+            local seed
+            seed=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.mldsa65Seed // empty' 2>/dev/null || true)
+            if [[ -n "$seed" ]]; then
+                mldsa_verify=$(mldsa65_verify_from_seed "$seed")
+            fi
+        fi
+        pqv_param=""
+        [[ -n "$mldsa_verify" ]] && pqv_param="&pqv=${mldsa_verify}"
+
         if [[ -z "$public_key" ]]; then
             [[ "$is_quiet" = false ]] && error "VLESS配置不完整，可能已损坏。"
         else
             display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
             link_name_raw="$host X-reality"
-            link_name_encoded=$(echo "$link_name_raw" | sed 's/ /%20/g')
-            vless_url="vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}#${link_name_encoded}"
+            link_name_encoded=$(printf '%s' "$link_name_raw" | jq -sRr @uri)
+            vless_url="vless://${uuid}@${display_ip}:${port}?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${shortid}${pqv_param}#${link_name_encoded}"
             links_array+=("$vless_url")
 
             if [[ "$is_quiet" = false ]]; then
@@ -779,6 +1235,15 @@ view_all_info() {
                 printf "    %s: ${cyan}%s${none}\n" "指纹" "chrome"
                 printf "    %s: ${cyan}%s${none}\n" "PublicKey" "${public_key}"
                 printf "    %s: ${cyan}%s${none}\n" "ShortId" "$shortid"
+                if [[ -n "$mldsa_verify" ]]; then
+                    printf "    %s: ${cyan}%s${none}\n" "ML-DSA-65 Verify (pqv)" "$mldsa_verify"
+                fi
+                local limit_upload
+                limit_upload=$(echo "$vless_inbound" | jq -r '.streamSettings.realitySettings.limitFallbackUpload // empty' 2>/dev/null || true)
+                if [[ -n "$limit_upload" ]]; then
+                    printf "    %s: ${cyan}%s${none}\n" "回落限速" \
+                        "after $(echo "$limit_upload" | jq -r '.afterBytes') 字节后限速 $(echo "$limit_upload" | jq -r '.bytesPerSec') B/s，突发 $(echo "$limit_upload" | jq -r '.burstBytesPerSec') B/s"
+                fi
             fi
         fi
     fi
@@ -786,15 +1251,18 @@ view_all_info() {
     local ss_inbound
     ss_inbound=$(jq '.inbounds[] | select(.protocol == "shadowsocks")' "$xray_config_path" 2>/dev/null || true)
     if [[ -n "$ss_inbound" ]]; then
-        local port method password link_name_raw user_info_base64 ss_url
+        local port method password link_name_raw ss_url encoded_pass encoded_tag display_host
         port=$(echo "$ss_inbound" | jq -r '.port')
         method=$(echo "$ss_inbound" | jq -r '.settings.method')
         password=$(echo "$ss_inbound" | jq -r '.settings.password')
         link_name_raw="$host X-ss2022"
-        user_info_base64=$(echo -n "${method}:${password}" | base64 -w 0)
-        ss_url="ss://${user_info_base64}@${ip}:${port}#${link_name_raw}"
+        # SIP002：2022 系列 AEAD 的 userinfo 必须明文 method:percentEncodedPassword，不能整体 base64
+        encoded_pass=$(printf '%s' "$password" | jq -sRr @uri)
+        encoded_tag=$(printf '%s' "$link_name_raw" | jq -sRr @uri)
+        display_host=$ip && [[ $ip =~ ":" ]] && display_host="[$ip]"
+        ss_url="ss://${method}:${encoded_pass}@${display_host}:${port}#${encoded_tag}"
         links_array+=("$ss_url")
-        
+
         if [[ "$is_quiet" = false ]]; then
             echo ""
             echo -e "${green} [ Shadowsocks-2022 配置 ]${none}"
@@ -802,7 +1270,6 @@ view_all_info() {
             printf "    %s: ${cyan}%s${none}\n" "服务器地址" "$ip"
             printf "    %s: ${cyan}%s${none}\n" "端口" "$port"
             printf "    %s: ${cyan}%s${none}\n" "加密方式" "$method"
-            # 修改：完整显示SS密钥
             printf "    %s: ${cyan}%s${none}\n" "密码" "${password}"
         fi
     fi
@@ -814,16 +1281,54 @@ view_all_info() {
             draw_divider
             printf "%s\n" "${links_array[@]}" > ~/xray_subscription_info.txt
             success "所有订阅链接已汇总保存到: ~/xray_subscription_info.txt"
-            
+
             echo -e "\n${yellow} --- V2Ray / Clash 等客户端可直接导入以下链接 --- ${none}\n"
             for link in "${links_array[@]}"; do
                 echo -e "${cyan}${link}${none}\n"
             done
+            if printf '%s\n' "${links_array[@]}" | grep -q 'pqv='; then
+                info "本节点已启用 mldsa65（链接含 pqv=）。Xray 系客户端（v2rayN 等）会识别 pqv；"
+                info "Mihomo/Clash 内核目前不支持该字段，请忽略 pqv 参数，其余参数照常填写即可连接。"
+            fi
+            print_client_notes
             draw_divider
         fi
     elif [[ "$is_quiet" = false ]]; then
         info "当前未安装任何协议，无订阅信息可显示。"
     fi
+}
+
+# 客户端兼容性提示：依据 Xray-core issue #6714 的官方结论
+print_client_notes() {
+    local notes
+    notes=$(cat <<'NOTE'
+
+ --- 客户端连接须知（重要） ---
+ [Xray 服务端 v26.9.8+ 的强制策略]
+ REALITY 服务端要求 Client Hello 必须携带 ML-KEM-768 的 key share，
+ 且必须排在 X25519 之前，否则直接回落到目标站，客户端表现为 "reality verification failed"。
+ 依据: https://github.com/XTLS/Xray-core/issues/6714#issuecomment-5581324161
+   原文: 对于 Xray 只有前三个指纹能连，对于 Mihomo 只能 Chrome，对于 sing-box 不能连
+
+ [Mihomo / Clash 用户 - 必须手动补这两行]
+   client-fingerprint: chrome
+   reality-opts:
+     support-x25519mlkem768: true      # 不写则内核会剥除 ML-KEM，必然连不上
+ 原因: Mihomo 的该开关默认 false，为 false 时会从 ClientHello 里剔除 ML-KEM。
+ 参考: https://github.com/MetaCubeX/mihomo/issues/3193
+ firefox 指纹在 Mihomo 下无法连接，必须用 chrome。
+
+ [vless:// 链接无法携带该参数]
+ VLESS 链接规范里没有 support-x25519mlkem768 字段，直接复制本链接到 Mihomo 会连不上，
+ 需要按上面的 YAML 手动补齐。Xray 系客户端（v2rayN 等）直接导入链接即可。
+
+ [已知受影响的客户端]
+ sing-box / Karing / Shadowrocket: 因 TLS 栈不发 ML-KEM，无法连接该服务端。
+ 参考: SagerNet/sing-box#4520, KaringX/karing#1952, MHSanaei/3x-ui#6563
+
+NOTE
+)
+    echo -e "${yellow}${notes}${none}"
 }
 
 # --- 核心安装逻辑函数 ---
@@ -835,8 +1340,10 @@ run_install_vless() {
         exit 1
     fi
     run_core_install || exit 1
+    # 核心刚装好，此时再探活一次（首次安装时 prompt 阶段还没有 xray，探活被跳过）
+    check_sni_target "$domain" || warning "SNI 探活未通过，仍继续安装；如连不上请更换域名。"
     info "正在生成 Reality 密钥对..."
-    local key_pair private_key public_key vless_inbound dokodemo_inbound
+    local key_pair private_key public_key vless_inbound dokodemo_inbound mldsa65_seed="" mldsa65_verify=""
     key_pair=$("$xray_binary_path" x25519)
     private_key=$(echo "$key_pair" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "$key_pair" | awk '/Password/ {print $3}')
@@ -846,10 +1353,15 @@ run_install_vless() {
         exit 1
     fi
 
-    vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port")
+    if prompt_for_mldsa65 "$domain" "$SNI_PQV" "$SNI_CHAIN_LEN" mldsa65_seed mldsa65_verify; then
+        write_mldsa65_verify "$mldsa65_verify"
+    fi
+    prompt_for_fallback_limit
+
+    vless_inbound=$(build_vless_inbound "$port" "$uuid" "$domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed" "$FALLBACK_LIMIT")
     dokodemo_inbound=$(build_dokodemo_inbound "$domain" "$internal_port")
     write_config "[$dokodemo_inbound, $vless_inbound]" "$domain"
-    
+
     if ! restart_xray; then exit 1; fi
 
     setup_firewalld "$port" "$internal_port"
@@ -883,8 +1395,9 @@ run_install_dual() {
         exit 1
     fi
     run_core_install || exit 1
+    check_sni_target "$vless_domain" || warning "SNI 探活未通过，仍继续安装；如连不上请更换域名。"
     info "正在生成 Reality 密钥对..."
-    local key_pair private_key public_key vless_inbound ss_inbound dokodemo_inbound
+    local key_pair private_key public_key vless_inbound ss_inbound dokodemo_inbound mldsa65_seed="" mldsa65_verify=""
     key_pair=$("$xray_binary_path" x25519)
     private_key=$(echo "$key_pair" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "$key_pair" | awk '/Password/ {print $3}')
@@ -894,11 +1407,15 @@ run_install_dual() {
         exit 1
     fi
 
-    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port")
+    if prompt_for_mldsa65 "$vless_domain" "$SNI_PQV" "$SNI_CHAIN_LEN" mldsa65_seed mldsa65_verify; then
+        write_mldsa65_verify "$mldsa65_verify"
+    fi
+
+    vless_inbound=$(build_vless_inbound "$vless_port" "$vless_uuid" "$vless_domain" "$private_key" "$public_key" "$internal_port" "$mldsa65_seed")
     dokodemo_inbound=$(build_dokodemo_inbound "$vless_domain" "$internal_port")
     ss_inbound=$(build_ss_inbound "$ss_port" "$ss_password")
     write_config "[$dokodemo_inbound, $vless_inbound, $ss_inbound]" "$vless_domain"
-    
+
     if ! restart_xray; then exit 1; fi
 
     setup_firewalld "$vless_port" "$internal_port"
@@ -919,14 +1436,16 @@ main_menu() {
         printf "  ${cyan}%-2s${none} %-35s\n" "5." "重启 Xray"
         printf "  ${magenta}%-2s${none} %-35s\n" "6." "查看 Xray 日志"
         printf "  ${green}%-2s${none} %-35s\n" "7." "查看订阅信息"
+        printf "  ${red}%-2s${none} %-35s\n" "8." "关闭 mldsa65 (回退纯 x25519)"
+        printf "  ${magenta}%-2s${none} %-35s\n" "9." "诊断 Xray 安装状态"
         draw_divider
         printf "  ${yellow}%-2s${none} %-35s\n" "0." "退出脚本"
         draw_divider
-        
-        read -p " 请输入选项 [0-7]: " choice || true
-        
+
+        read -p " 请输入选项 [0-9]: " choice || true
+
         local needs_pause=true
-        
+
         case "$choice" in
             1) install_menu ;;
             2) update_xray ;;
@@ -935,10 +1454,12 @@ main_menu() {
             5) restart_xray ;;
             6) view_xray_log; needs_pause=false ;;
             7) view_all_info ;;
+            8) disable_mldsa65 ;;
+            9) diagnose_xray ;;
             0) success "感谢使用！"; exit 0 ;;
-            *) error "无效选项。请输入0到7之间的数字。" ;;
+            *) error "无效选项。请输入0到9之间的数字。" ;;
         esac
-        
+
         if [ "$needs_pause" = true ]; then
             press_any_key_to_continue
         fi
@@ -954,7 +1475,7 @@ non_interactive_usage() {
 
   通用选项:
     --type <type>      安装类型 (必须: vless, ss, dual)
-    --quiet            静默模式, <em>成功</em>后只输出订阅链接
+    --quiet            静默模式, 成功后只输出订阅链接
 
   VLESS 选项:
     --vless-port <p>   VLESS 端口 (默认: 443)
