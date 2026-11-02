@@ -51,7 +51,11 @@ error() {
             echo -e "${yellow}提示: 请使用 sudo 运行脚本${none}" >&2 ;;
         *"端口"*)
             echo -e "${yellow}提示: 尝试使用其他端口号${none}" >&2 ;;
+        *)
+            : ;;
     esac
+    # 显式返回 0：set -e 下若 case 无匹配则函数返回 1，会导致调用方在 return 前被终止
+    return 0
 }
 
 info() { [[ "$is_quiet" = false ]] && echo -e "\n${yellow}[!] $1${none}\n" || true; }
@@ -1024,12 +1028,14 @@ update_xray() {
     current_version=$("$xray_binary_path" version 2>/dev/null | head -n 1 | awk '{print $2}')
 
     # -fSL: HTTP 错误直接失败；--max-time 防止卡死；不再静默吞掉限流/网络错误
+    local curl_rc=0
     api_resp=$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' \
-        https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null) || {
-        error "请求 GitHub API 失败（网络不可达，或 API 已限流）。"
+        https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null) || curl_rc=$?
+    if [[ "$curl_rc" != 0 ]]; then
+        error "请求 GitHub API 失败（curl 退出码 ${curl_rc}：6=DNS 解析失败, 7=连接失败, 28=超时）。"
         info "可手动更新: bash -c \"\$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install"
         return 1
-    }
+    fi
     latest_version=$(echo "$api_resp" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
     if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
         error "无法解析最新版本号（GitHub API 可能已限流，未认证请求限制为 60 次/小时）。"
@@ -1720,15 +1726,15 @@ main_menu() {
         local needs_pause=true
 
         case "$choice" in
-            1) install_menu ;;
-            2) update_xray ;;
-            3) uninstall_xray ;;
-            4) modify_config_menu ;;
-            5) restart_xray ;;
+            1) install_menu || true ;;
+            2) update_xray || true ;;
+            3) uninstall_xray || true ;;
+            4) modify_config_menu || true ;;
+            5) restart_xray || true ;;
             6) view_xray_log; needs_pause=false ;;
-            7) view_all_info ;;
-            8) disable_mldsa65 ;;
-            9) diagnose_xray ;;
+            7) view_all_info || true ;;
+            8) disable_mldsa65 || true ;;
+            9) diagnose_xray || true ;;
             0) success "感谢使用！"; exit 0 ;;
             *) error "无效选项。请输入0到9之间的数字。" ;;
         esac
