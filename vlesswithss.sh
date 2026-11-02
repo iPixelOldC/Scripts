@@ -543,26 +543,20 @@ execute_official_script() {
         return 1
     fi
 
-    # 用临时脚本文件 + `bash <file> @ <args>`：官方安装器要求 @ 分隔符，
-    # 且 `bash -s -- xxx` 会让 bash 把 xxx 当自己的选项而报 "unknown option"
-    local script_file
-    script_file=$(mktemp /tmp/xray-install-XXXXXX.sh 2>/dev/null || echo "/tmp/xray-install-$$.sh")
-    printf '%s\n' "$script_content" > "$script_file"
-    chmod +x "$script_file"
-
-    # 官方调用形式: bash <script> @ install / @ install-geodata / @ remove --purge
-    # shellcheck disable=SC2086  # args 需要按空格拆分（如 "remove --purge"）
-    bash "$script_file" @ $args > "$log_file" 2>&1 &
+    # 官方调用形式: bash -c "<script>" @ <command> [options]
+    # 这里的 @ 是 $0 占位符（防止后续参数被 bash 当自身选项），
+    # 不能写成 bash script.sh @ args —— 那样 --xxx 会被 bash 自身解析报 unknown option
+    # shellcheck disable=SC2086  # args 需按空格拆分（如 "install --without-geodata"）
+    bash -c "$script_content" @ $args > "$log_file" 2>&1 &
     pid=$!
     spinner $pid
     if ! wait $pid; then
         error "官方安装器执行失败（参数: ${args}），日志摘要："
         tail -n 25 "$log_file" >&2
         info "完整日志保留在: ${cyan}${log_file}${none}"
-        rm -f "$script_file"
         return 1
     fi
-    rm -f "$log_file" "$script_file"
+    rm -f "$log_file"
     return 0
 }
 
