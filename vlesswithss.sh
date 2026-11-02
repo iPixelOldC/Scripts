@@ -6,8 +6,16 @@
 # 更新日志 (v2.10.0):
 # - [新增] mldsa65 抗量子签名：tls ping 探测 pqv + 证书链 >3500 时询问是否启用
 # - [新增] 回落限速 limitFallbackUpload/Download：参数随机化，避免脚本指纹
+# - [新增] dokodemo-door 防盗刷开关：默认关闭（dest 直连目标），支持运行时切换
 # - [新增] 菜单 9「诊断 Xray 安装状态」，一次输出二进制/服务/配置/网络/磁盘状态
+# - [新增] reality-checker 集成：自动探测工具，展示 CDN/被墙/热门度报告
 # - [新增] view_all_info 输出客户端兼容提示（Mihomo 需 chrome + ML-KEM 开关）
+# - [修复] 官方安装器子命令错误：install-geodata → update-geodata（官方无前者）
+# - [修复] 官方安装器调用形式：bash -c "<script>" @ <cmd>（原 bash -s -- 会误解析 --xxx）
+# - [修复] check_xray_status 在 pipefail 下因 SIGPIPE 输出"未知"版本号
+# - [修复] update_xray 中 current_version/new_version 取值为空导致误判
+# - [修复] error() 在 case 无匹配时返回 1，配合 set -e 会在 return 前终止脚本
+# - [修复] main_menu 对功能函数返回值兜底，避免单项失败导致整个菜单退出
 # - [修复] 官方安装器输出不再丢弃，失败时回显日志摘要
 # - [修复] update_xray 校验 API 响应、检查 run_core_install 返回值、更新后回读版本
 # - [修复] 回落限速随机数改用 SRANDOM，修正 RANDOM 16 位导致的抖动范围过窄
@@ -17,7 +25,9 @@
 # - [修复] SNI target 探活：tls ping 校验 with SNI 必须握手成功，并输出 pqv/证书链长度
 # - [修复] SS2022 分享链接按 SIP002 明文 method:percentEncodedPassword，IPv6 补 []，tag 编码
 # - [修复] get_public_ip 中 ((attempts++)) 在 set -e 下中断函数，导致 IPv6 回退失效
-# - [修复] 卸载时清理本脚本添加的 firewalld 规则
+# - [修复] 卸载时清理本脚本添加的 firewalld 规则与历史端口残留提示
+# - [修复] 双协议安装漏传 FALLBACK_LIMIT，导致限速设置静默失效
+# - [修复] 修改配置时防火墙不清理旧端口，导致改端口后旧端口持续开放
 # - [维护] 清理 shellcheck SC1087/SC2034 告警（颜色变量加花括号、nameref 抑制注释）
 # ==============================================================================
 
@@ -581,7 +591,8 @@ install_geodata() {
     local need_geosite=false need_geoip=false answer=""
 
     info "正在更新 GeoIP 和 GeoSite 数据文件..."
-    if ! execute_official_script "install-geodata"; then
+    # 官方子命令是 update-geodata，不是 install-geodata
+    if ! execute_official_script "update-geodata"; then
         error "Geo-data 更新失败！"
         info "这通常不影响核心功能，您可以稍后手动更新。"
     fi
