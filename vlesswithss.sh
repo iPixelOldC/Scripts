@@ -126,7 +126,12 @@ check_xray_status() {
         return
     fi
     local xray_version
-    xray_version=$("$xray_binary_path" version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知")
+    # 不用管道 + head：pipefail 下 xray 会因 SIGPIPE(141) 让整个管道失败，
+    # 导致 || echo "未知" 被触发，把 "未知" 拼进版本号
+    local ver_line
+    ver_line=$("$xray_binary_path" version 2>/dev/null | sed -n '1p') || ver_line=""
+    xray_version=$(echo "$ver_line" | awk '{print $2}')
+    [[ -z "$xray_version" ]] && xray_version="未知"
     local service_status
     if systemctl is-active --quiet xray 2>/dev/null; then
         service_status="${green}运行中${none}"
@@ -538,17 +543,26 @@ execute_official_script() {
         return 1
     fi
 
-    # 不再 &> /dev/null：输出写入日志，失败时回显，便于定位真正原因
-    echo "$script_content" | bash -s -- $args > "$log_file" 2>&1 &
+    # 用临时脚本文件 + `bash <file> @ <args>`：官方安装器要求 @ 分隔符，
+    # 且 `bash -s -- xxx` 会让 bash 把 xxx 当自己的选项而报 "unknown option"
+    local script_file
+    script_file=$(mktemp /tmp/xray-install-XXXXXX.sh 2>/dev/null || echo "/tmp/xray-install-$$.sh")
+    printf '%s\n' "$script_content" > "$script_file"
+    chmod +x "$script_file"
+
+    # 官方调用形式: bash <script> @ install / @ install-geodata / @ remove --purge
+    # shellcheck disable=SC2086  # args 需要按空格拆分（如 "remove --purge"）
+    bash "$script_file" @ $args > "$log_file" 2>&1 &
     pid=$!
     spinner $pid
     if ! wait $pid; then
         error "官方安装器执行失败（参数: ${args}），日志摘要："
         tail -n 25 "$log_file" >&2
         info "完整日志保留在: ${cyan}${log_file}${none}"
+        rm -f "$script_file"
         return 1
     fi
-    rm -f "$log_file"
+    rm -f "$log_file" "$script_file"
     return 0
 }
 
@@ -738,7 +752,7 @@ check_sni_target() {
                 if echo "$output" | grep -q "TLS Post-Quantum key exchange:[[:space:]]*true"; then
                     SNI_PQV=true
                 fi
-                SNI_CHAIN_LEN=$(echo "$output" | grep "Certificate chain's total length" | head -n 1 | awk '{print $5}') || SNI_CHAIN_LEN=""
+                SNI_CHAIN_LEN=$(echo "$output" | grep "Certificate chain's total length" | sed -n '1p' | awk '{print $5}') || SNI_CHAIN_LEN=""
                 info "SNI 探活通过。后量子密钥交换: ${cyan}${SNI_PQV}${none}${SNI_CHAIN_LEN:+, 证书链长度: ${cyan}${SNI_CHAIN_LEN}${none}}"
 
                 if [[ "$SNI_PQV" = true ]]; then
@@ -1025,7 +1039,7 @@ update_xray() {
     if [[ ! -f "$xray_binary_path" ]]; then error "错误: Xray 未安装。" && return; fi
     info "正在检查最新版本..."
     local current_version latest_version api_resp force=""
-    current_version=$("$xray_binary_path" version 2>/dev/null | head -n 1 | awk '{print $2}')
+    current_version=$("$xray_binary_path" version 2>/dev/null | sed -n '1p' | awk '{print $2}')
 
     # -fSL: HTTP 错误直接失败；--max-time 防止卡死；不再静默吞掉限流/网络错误
     local curl_rc=0
@@ -1067,7 +1081,7 @@ update_xray() {
 
     # 回读实际版本，避免“看起来成功”
     local new_version
-    new_version=$("$xray_binary_path" version 2>/dev/null | head -n 1 | awk '{print $2}')
+    new_version=$("$xray_binary_path" version 2>/dev/null | sed -n '1p' | awk '{print $2}')
     if [[ "$new_version" == "$latest_version" ]]; then
         if [[ "$current_version" == "$latest_version" ]]; then
             success "重装完成：版本 ${new_version} 未变（安装链路正常）。"
@@ -1088,7 +1102,7 @@ diagnose_xray() {
     draw_divider
     echo -e " 二进制路径: ${xray_binary_path}"
     if [[ -x "$xray_binary_path" ]]; then
-        echo -e " 版本: $("$xray_binary_path" version 2>&1 | head -n 1 || echo '执行失败')"
+        echo -e " 版本: $("$xray_binary_path" version 2>&1 | sed -n '1p')"
         echo -e " 二进制修改时间: $(stat -c '%y' "$xray_binary_path" 2>/dev/null || echo '未知')"
         echo -e " 二进制大小: $(stat -c '%s' "$xray_binary_path" 2>/dev/null || echo '未知') 字节"
     else
